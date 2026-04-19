@@ -1,0 +1,14 @@
+# Output di Cargo
+/target/
+
+# File di lock generati da Cargo
+Cargo.lock
+
+# File di backup e file temporanei
+**/*.rs.bk
+
+# File specifici dell'IDE (opzionale, ma consigliato)
+.idea/
+.vscode/
+*.swp
+*.swo
