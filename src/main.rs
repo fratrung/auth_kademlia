@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use auth_kademlia::auth_handler::DIDSignatureVerifierHandler;
-use auth_kademlia::network::Server;
+use auth_kademlia_rs::auth_handler::DIDSignatureVerifierHandler;
+use auth_kademlia_rs::network::Server;
 
 #[tokio::main]
 async fn main() {

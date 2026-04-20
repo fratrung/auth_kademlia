@@ -2,8 +2,8 @@
 use std::sync::Arc;
 use std::path::PathBuf;
 
-use auth_kademlia::auth_handler::DIDSignatureVerifierHandler;
-use auth_kademlia::network::Server;
+use auth_kademlia_rs::auth_handler::DIDSignatureVerifierHandler;
+use auth_kademlia_rs::network::Server;
 
 use pqcrypto_dilithium::dilithium2;
 use pqcrypto_kyber::kyber512;

@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use auth_kademlia::auth_handler::DIDSignatureVerifierHandler;
-use auth_kademlia::network::Server;
+use auth_kademlia_rs::auth_handler::DIDSignatureVerifierHandler;
+use auth_kademlia_rs::network::Server;
 
 // ─── Post-quantum primitives ──────────────────────────────────────────────────
 // These come from the `pqcrypto` family of crates.
