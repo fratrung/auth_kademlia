@@ -21,10 +21,20 @@ fn base64url_encode(pk: &[u8]) -> String {
 
 /// Serialize a DID Document to canonical JSON bytes (sorted keys, no spaces).
 fn encode_did_document(doc: &Value) -> Vec<u8> {
-    // serde_json does not guarantee key order on serialization of arbitrary
-    // Value objects, so we convert to a BTreeMap-backed Value first.
     let canonical = sort_json_keys(doc);
     serde_json::to_vec(&canonical).expect("DID Document serialization failed")
+}
+
+fn decode_signed_record(record: Vec<u8>) -> Option<(String, Vec<u8>)> {
+    if record.len() <= 12 { return None; }
+    
+    let sig_len = 2420; // Dilithium2 Signature length
+    if record.len() < 12 + sig_len { return None; }
+    
+    let json_bytes = &record[12 + sig_len..];
+    let doc: Value = serde_json::from_slice(json_bytes).ok()?;
+    
+    Some((serde_json::to_string_pretty(&doc).unwrap(), json_bytes.to_vec()))
 }
 
 /// Recursively sort all object keys so serialization is deterministic.
@@ -72,12 +82,10 @@ fn build_signed_record(
     record
 }
 
-/// Generate a `did:iiot` URI using a random UUID v4.
 fn generate_did_iiot() -> String {
     format!("did:iiot:{}", Uuid::new_v4())
 }
 
-/// Build a minimal `did:iiot` DID Document with one Dilithium and one Kyber key.
 fn build_did_document(
     did: &str,
     dilithium_pk: &dilithium2::PublicKey,
@@ -136,72 +144,76 @@ async fn start_node(port: u16) -> Server {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let port: u16 = std::env::var("NODE_PORT").unwrap_or_else(|_| "5678".to_string()).parse()?;
-    let server = start_node(port).await;
+    let mut server = start_node(port).await;
 
     if std::env::var("IS_SEED").is_ok() {
-        println!(">>> Running as Seed Node on port {}", port);
-        println!(">>> Waiting for 1 peer to join the network...");
-        loop {
-            if let Some(ref protocol) = server.protocol {
-            let routing_table = protocol.router.lock().await;
-                let peer_count: usize = routing_table.buckets().iter().map(|b| b.len()).sum();
-                if peer_count >= 1 {
-                    println!(">>> Network condition met ({} peers). Proceeding...", peer_count);
-                    break;
-                }
-                drop(routing_table);
-            }
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
+        println!(">>> Running as Seed Node. Ready.");
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
     } else if let Ok(bootstrap_addr) = std::env::var("BOOTSTRAP_ADDR") {
         let parts: Vec<&str> = bootstrap_addr.split(':').collect();
         let ip = parts[0].to_string();
         let port: u16 = parts[1].parse()?;
         
-        println!(">>> Running as Peer. Bootstrapping to {}:{}...", ip, port);
-        
-        /*println!(">>> Checking connection to seed via socket...");
-        match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-            Ok(sock) => {
-                let addr = format!("{}:{}", ip, port);
-                println!(">>> Attempting to send ping to {}", addr);
-                let _ = sock.send_to(b"ping", addr).await;
+        println!(">>> Bootstrapping to {}:{}...", ip, port);
+        let mut retries = 0;
+        while retries < 5 {
+            let discovered = server.bootstrap(vec![(ip.clone(), port)]).await;
+            if !discovered.is_empty() {
+                println!(">>> Bootstrap success! Discovered {} nodes.", discovered.len());
+                break;
             }
-            Err(e) => println!(">>> Socket bind error: {:?}", e),
-        }*/
-
-        let discovered = server.bootstrap(vec![(ip, port)]).await;
-        println!(">>> Bootstrap complete. Discovered {} nodes.", discovered.len());
-        
-        if let Some(ref protocol) = server.protocol {
-            let rt = protocol.router.lock().await;
-            let total: usize = rt.buckets().iter().map(|b| b.len()).sum();
-            println!(">>> Routing table size: {} nodes", total);
+            println!(">>> Bootstrap empty, retrying...");
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            retries += 1;
         }
     }
 
+    println!(">>> Starting publication process...");
+    
     let (dilithium_pk, dilithium_sk) = dilithium2::keypair();
-        let (kyber_pk, _) = kyber512::keypair();
-        let did = generate_did_iiot();
-        let dht_key = did.split(':').last().unwrap().to_string();
-        let signed_record = build_signed_record(&build_did_document(&did, &dilithium_pk, &kyber_pk), &dilithium_sk, "Dilithium-2");
+    let (kyber_pk, _) = kyber512::keypair();
+    let did = generate_did_iiot();
+    let dht_key = did.split(':').last().unwrap().to_string();
+    let signed_record = build_signed_record(&build_did_document(&did, &dilithium_pk, &kyber_pk), &dilithium_sk, "Dilithium-2");
 
-        let mut attempt = 0;
-        while attempt < 10 {
-            println!(">>> Attempt {}/10: Setting key did:iiot:{} ", attempt + 1, dht_key);
-            match server.set(&dht_key, signed_record.clone()).await {
-                Some(true) => {
-                    println!(">>> SUCCESS: DID Document published!");
-                    break;
-                }
-                Some(false) => println!(">>> WARNING: Server returned false."),
-                None => println!(">>> ERROR: Server returned None (timeout or internal error)."),
+    let mut attempt = 0;
+    while attempt < 10 {
+        match server.set(&dht_key, signed_record.clone()).await {
+            Some(true) => {
+                println!(">>> SUCCESS: DID Document published!");
+                break;
             }
-            attempt += 1;
-            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            _ => {
+                println!(">>> Attempt {}/10 failed, retrying...", attempt + 1);
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                attempt += 1;
+            }
         }
+    }
+
+    println!(">>> Testing retrieval for key: {}", dht_key);
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    match server.get(&dht_key).await {
+        Some(record) => {
+            println!(">>> SUCCESS: Record found in DHT!");
+            if let Some((json_str, _)) = decode_signed_record(record) {
+                println!(">>> Decoded DID Document:\n{}", json_str);
+            } else {
+                println!(">>> ERROR: Could not decode record structure.");
+            }
+        }
+        None => println!(">>> ERROR: Record not found in DHT."),
+    }
+
+    println!(">>> Node active and listening for DHT requests.");
 
     tokio::signal::ctrl_c().await?;
+    
+    println!("\n>>> Shutdown signal received. Cleaning up...");
+    server.stop().await;
+
+    println!(">>> Node stopped gracefully.");
     Ok(())
 }
