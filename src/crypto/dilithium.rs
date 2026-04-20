@@ -1,122 +1,168 @@
-/// Dilithium post-quantum signature verifier.
+/// Dilithium post-quantum signature verifier and signer.
 ///
-/// NOTA: la libreria `dilithium` pura in Rust non è ancora su crates.io con
-/// un'API stabile. Le opzioni consigliate sono:
-///   1. `pqcrypto-dilithium`  (bindings C via liboqs)
-///   2. `oqs` crate (Open Quantum Safe)
-///   3. Chiamare il codice Python via FFI/subprocess durante la transizione
+/// Mirrors Python's `DilithiumSignatureVerifier` and `DilithiumSigner`:
 ///
-/// Questo modulo usa l'approccio `oqs` come implementazione di riferimento.
-/// Per attivarlo aggiungere in Cargo.toml:
-///   oqs = { version = "0.9", features = ["dilithium2","dilithium3","dilithium5"] }
+/// ```python
+/// LENGTH_SECURITY_LEVEL = { (1312, 2528): 2, (1952, 4000): 3, (2592, 4864): 5 }
 ///
-/// Per ora l'implementazione è uno stub che ritorna Err se non compilato
-/// con la feature "dilithium_oqs".
+/// class DilithiumSignatureVerifier:
+///     def verify(public_key, signature, message):
+///         level = infer from len(public_key)
+///         return DilithiumN.verify(public_key, message, signature)
+///
+/// class DilithiumSigner:
+///     def sign(private_key, message):
+///         level = infer from len(private_key)
+///         return DilithiumN.sign(private_key, message)
+/// ```
+///
+/// Security level is inferred automatically from the key length,
+/// exactly as in the Python implementation.
+use pqcrypto_dilithium::{dilithium2, dilithium3, dilithium5};
+use pqcrypto_traits::sign::{
+    DetachedSignature, PublicKey as PQPublicKey, SecretKey as PQSecretKey,
+};
 
-use crate::crypto::signature_verifier::{SignatureVerifier, Signer, VerifierError};
+use crate::crypto::signature_verifier::{
+    dilithium_level_from_privkey_len, dilithium_level_from_pubkey_len, Signer,
+    SignatureVerifier, VerifierError,
+};
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Verifier
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub struct DilithiumSignatureVerifier;
-pub struct DilithiumSigner;
-
-/// Determina il security level dalla lunghezza della chiave pubblica
-/// Matches Python: {(1312, 2528): 2, (1952, 4000): 3, (2592, 4864): 5}
-fn security_level_from_pub_key_len(len: usize) -> Option<u8> {
-    match len {
-        1312 => Some(2),
-        1952 => Some(3),
-        2592 => Some(5),
-        _ => None,
-    }
-}
-
-/// Determina il security level dalla lunghezza della chiave privata
-fn security_level_from_priv_key_len(len: usize) -> Option<u8> {
-    match len {
-        2528 => Some(2),
-        4000 => Some(3),
-        4864 => Some(5),
-        _ => None,
-    }
-}
 
 impl SignatureVerifier for DilithiumSignatureVerifier {
+    /// Verify a Dilithium detached signature.
+    ///
+    /// The security level is inferred from `public_key.len()`:
+    /// - 1312 bytes → Dilithium2
+    /// - 1952 bytes → Dilithium3
+    /// - 2592 bytes → Dilithium5
     fn verify(
         &self,
         public_key: &[u8],
-        _signature: &[u8],
-        _message: &[u8],
+        signature: &[u8],
+        message: &[u8],
     ) -> Result<bool, VerifierError> {
-        let level = security_level_from_pub_key_len(public_key.len()).ok_or_else(|| {
-            VerifierError::InvalidKeyLength(public_key.len())
-        })?;
+        let level = dilithium_level_from_pubkey_len(public_key.len())
+            .ok_or(VerifierError::InvalidKeyLength(public_key.len()))?;
 
-        #[cfg(feature = "dilithium_oqs")]
-        {
-            use oqs::sig::{Algorithm, Sig};
-            let alg = match level {
-                2 => Algorithm::Dilithium2,
-                3 => Algorithm::Dilithium3,
-                5 => Algorithm::Dilithium5,
-                _ => unreachable!(),
-            };
-            let scheme = Sig::new(alg)
-                .map_err(|e| VerifierError::VerificationFailed(e.to_string()))?;
-            let pk = scheme.public_key_from_bytes(public_key)
-                .ok_or_else(|| VerifierError::VerificationFailed("Invalid public key".to_string()))?;
-            let sig = scheme.signature_from_bytes(signature)
-                .ok_or_else(|| VerifierError::VerificationFailed("Invalid signature".to_string()))?;
-            return scheme.verify(message, sig, pk)
-                .map(|_| true)
-                .map_err(|e| VerifierError::VerificationFailed(e.to_string()));
-        }
-
-        #[cfg(not(feature = "dilithium_oqs"))]
-        {
-            log::warn!(
-                "Dilithium{} verify called but feature 'dilithium_oqs' is not enabled. \
-                 Add `oqs` crate to Cargo.toml to enable post-quantum verification.",
-                level
-            );
-            Err(VerifierError::UnsupportedAlgorithm(
-                "Dilithium requires feature 'dilithium_oqs'".to_string(),
-            ))
+        match level {
+            2 => verify_d2(public_key, signature, message),
+            3 => verify_d3(public_key, signature, message),
+            5 => verify_d5(public_key, signature, message),
+            _ => unreachable!(),
         }
     }
 }
 
+fn verify_d2(pk: &[u8], sig: &[u8], msg: &[u8]) -> Result<bool, VerifierError> {
+    let pk = dilithium2::PublicKey::from_bytes(pk)
+        .map_err(|_| VerifierError::InvalidKeyLength(pk.len()))?;
+    let sig = dilithium2::DetachedSignature::from_bytes(sig)
+        .map_err(|_| VerifierError::VerificationFailed("invalid signature bytes".into()))?;
+    Ok(dilithium2::verify_detached_signature(&sig, msg, &pk).is_ok())
+}
+
+fn verify_d3(pk: &[u8], sig: &[u8], msg: &[u8]) -> Result<bool, VerifierError> {
+    let pk = dilithium3::PublicKey::from_bytes(pk)
+        .map_err(|_| VerifierError::InvalidKeyLength(pk.len()))?;
+    let sig = dilithium3::DetachedSignature::from_bytes(sig)
+        .map_err(|_| VerifierError::VerificationFailed("invalid signature bytes".into()))?;
+    Ok(dilithium3::verify_detached_signature(&sig, msg, &pk).is_ok())
+}
+
+fn verify_d5(pk: &[u8], sig: &[u8], msg: &[u8]) -> Result<bool, VerifierError> {
+    let pk = dilithium5::PublicKey::from_bytes(pk)
+        .map_err(|_| VerifierError::InvalidKeyLength(pk.len()))?;
+    let sig = dilithium5::DetachedSignature::from_bytes(sig)
+        .map_err(|_| VerifierError::VerificationFailed("invalid signature bytes".into()))?;
+    Ok(dilithium5::verify_detached_signature(&sig, msg, &pk).is_ok())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Signer
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub struct DilithiumSigner;
+
 impl Signer for DilithiumSigner {
-    fn sign(&self, private_key: &[u8], _message: &[u8]) -> Result<Vec<u8>, VerifierError> {
-        let level = security_level_from_priv_key_len(private_key.len()).ok_or_else(|| {
-            VerifierError::InvalidKeyLength(private_key.len())
-        })?;
+    /// Sign `message` with a Dilithium private key.
+    ///
+    /// The security level is inferred from `private_key.len()`:
+    /// - 2528 bytes → Dilithium2
+    /// - 4000 bytes → Dilithium3
+    /// - 4864 bytes → Dilithium5
+    fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<Vec<u8>, VerifierError> {
+        let level = dilithium_level_from_privkey_len(private_key.len())
+            .ok_or(VerifierError::InvalidKeyLength(private_key.len()))?;
 
-        #[cfg(feature = "dilithium_oqs")]
-        {
-            use oqs::sig::{Algorithm, Sig};
-            let alg = match level {
-                2 => Algorithm::Dilithium2,
-                3 => Algorithm::Dilithium3,
-                5 => Algorithm::Dilithium5,
-                _ => unreachable!(),
-            };
-            let scheme = Sig::new(alg)
-                .map_err(|e| VerifierError::VerificationFailed(e.to_string()))?;
-            let sk = scheme.secret_key_from_bytes(private_key)
-                .ok_or_else(|| VerifierError::VerificationFailed("Invalid secret key".to_string()))?;
-            return scheme.sign(message, sk)
-                .map(|s| s.into_vec())
-                .map_err(|e| VerifierError::VerificationFailed(e.to_string()));
+        match level {
+            2 => sign_d2(private_key, message),
+            3 => sign_d3(private_key, message),
+            5 => sign_d5(private_key, message),
+            _ => unreachable!(),
         }
+    }
+}
 
-        #[cfg(not(feature = "dilithium_oqs"))]
-        {
-            log::warn!(
-                "Dilithium{} sign called but feature 'dilithium_oqs' is not enabled.",
-                level
-            );
-            Err(VerifierError::UnsupportedAlgorithm(
-                "Dilithium requires feature 'dilithium_oqs'".to_string(),
-            ))
-        }
+fn sign_d2(sk: &[u8], msg: &[u8]) -> Result<Vec<u8>, VerifierError> {
+    let sk = dilithium2::SecretKey::from_bytes(sk)
+        .map_err(|_| VerifierError::InvalidKeyLength(sk.len()))?;
+    Ok(dilithium2::detached_sign(msg, &sk).as_bytes().to_vec())
+}
+
+fn sign_d3(sk: &[u8], msg: &[u8]) -> Result<Vec<u8>, VerifierError> {
+    let sk = dilithium3::SecretKey::from_bytes(sk)
+        .map_err(|_| VerifierError::InvalidKeyLength(sk.len()))?;
+    Ok(dilithium3::detached_sign(msg, &sk).as_bytes().to_vec())
+}
+
+fn sign_d5(sk: &[u8], msg: &[u8]) -> Result<Vec<u8>, VerifierError> {
+    let sk = dilithium5::SecretKey::from_bytes(sk)
+        .map_err(|_| VerifierError::InvalidKeyLength(sk.len()))?;
+    Ok(dilithium5::detached_sign(msg, &sk).as_bytes().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dilithium2_sign_verify_roundtrip() {
+        let (pk, sk) = dilithium2::keypair();
+        let msg = b"test message for dilithium2";
+        let signer = DilithiumSigner;
+        let sig = signer.sign(sk.as_bytes(), msg).unwrap();
+        let verifier = DilithiumSignatureVerifier;
+        assert!(verifier.verify(pk.as_bytes(), &sig, msg).unwrap());
+    }
+
+    #[test]
+    fn dilithium3_sign_verify_roundtrip() {
+        let (pk, sk) = dilithium3::keypair();
+        let msg = b"test message for dilithium3";
+        let signer = DilithiumSigner;
+        let sig = signer.sign(sk.as_bytes(), msg).unwrap();
+        let verifier = DilithiumSignatureVerifier;
+        assert!(verifier.verify(pk.as_bytes(), &sig, msg).unwrap());
+    }
+
+    #[test]
+    fn dilithium2_tampered_message_fails() {
+        let (pk, sk) = dilithium2::keypair();
+        let sig = DilithiumSigner.sign(sk.as_bytes(), b"original").unwrap();
+        let verifier = DilithiumSignatureVerifier;
+        assert!(!verifier.verify(pk.as_bytes(), &sig, b"tampered").unwrap());
+    }
+
+    #[test]
+    fn wrong_key_length_errors() {
+        let verifier = DilithiumSignatureVerifier;
+        assert!(verifier.verify(&[0u8; 100], &[0u8; 2420], b"msg").is_err());
     }
 }

@@ -1,71 +1,42 @@
-use std::collections::HashMap;
+/// Base traits, error types, and algorithm registry for signature verification.
+///
+/// Mirrors the Python modules `signature_verifier.py` and `signer.py`:
+///
+/// ```python
+/// SIGNATURE_ALG_LENGTHS = {
+///     "RSA": 256,
+///     "Dilithium": { 2: 2420, 3: 3293, 5: 4595 },
+///     "Ed25519": 64,
+/// }
+/// ```
+///
+/// `resolve_alg_and_length("Dilithium-3")` → `("Dilithium", 3293)`
+/// `resolve_alg_and_length("Ed25519")`     → `("Ed25519", 64)`
 use thiserror::Error;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Error type
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
 pub enum VerifierError {
-    #[error("Unsupported algorithm: {0}")]
+    #[error("unsupported algorithm: {0}")]
     UnsupportedAlgorithm(String),
-    #[error("Invalid key length: {0}")]
+
+    #[error("invalid key length: {0} bytes")]
     InvalidKeyLength(usize),
-    #[error("Verification failed: {0}")]
+
+    #[error("verification failed: {0}")]
     VerificationFailed(String),
 }
 
-/// Lunghezze delle firme per ogni algoritmo supportato.
-/// Per Dilithium: security_level -> signature_length
-/// Matches Python's SIGNATURE_ALG_LENGTHS
-#[derive(Debug, Clone)]
-pub enum AlgLength {
-    Fixed(usize),
-    Leveled(HashMap<u8, usize>), // security_level -> sig_length
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Traits
+// ─────────────────────────────────────────────────────────────────────────────
 
-pub fn signature_alg_lengths() -> HashMap<&'static str, AlgLength> {
-    let mut map = HashMap::new();
-    map.insert("RSA", AlgLength::Fixed(256));
-    map.insert("Ed25519", AlgLength::Fixed(64));
-
-    let mut dilithium_levels = HashMap::new();
-    dilithium_levels.insert(2u8, 2420usize);
-    dilithium_levels.insert(3u8, 3293usize);
-    dilithium_levels.insert(5u8, 4595usize);
-    map.insert("Dilithium", AlgLength::Leveled(dilithium_levels));
-
-    map
-}
-
-/// Risolve l'algoritmo e la lunghezza della firma dalla stringa
-/// Es: "Ed25519" -> ("Ed25519", 64)
-/// Es: "Dilithium-3" -> ("Dilithium", 3293)
-pub fn resolve_alg_and_length(algorithm_str: &str) -> Result<(String, usize), VerifierError> {
-    let parts: Vec<&str> = algorithm_str.splitn(2, '-').collect();
-    let alg = parts[0];
-    let level: Option<u8> = parts.get(1).and_then(|s| s.parse().ok());
-
-    let lengths = signature_alg_lengths();
-    match lengths.get(alg) {
-        None => Err(VerifierError::UnsupportedAlgorithm(alg.to_string())),
-        Some(AlgLength::Fixed(len)) => Ok((alg.to_string(), *len)),
-        Some(AlgLength::Leveled(map)) => {
-            let lvl = level.ok_or_else(|| {
-                VerifierError::UnsupportedAlgorithm(format!(
-                    "{} requires a security level (e.g. Dilithium-3)",
-                    alg
-                ))
-            })?;
-            let len = map.get(&lvl).ok_or_else(|| {
-                VerifierError::UnsupportedAlgorithm(format!(
-                    "Unknown Dilithium level: {}",
-                    lvl
-                ))
-            })?;
-            Ok((alg.to_string(), *len))
-        }
-    }
-}
-
-/// Trait base per tutti i verifier
+/// Stateless signature verifier — equivalent to Python's `SignatureVerifier` ABC.
 pub trait SignatureVerifier: Send + Sync {
+    /// Return `true` if `signature` over `message` is valid for `public_key`.
     fn verify(
         &self,
         public_key: &[u8],
@@ -74,8 +45,127 @@ pub trait SignatureVerifier: Send + Sync {
     ) -> Result<bool, VerifierError>;
 }
 
-/// Trait base per tutti i signer
+/// Stateless signer — equivalent to Python's `Signer` ABC.
 pub trait Signer: Send + Sync {
+    /// Sign `message` with `private_key` and return the raw signature bytes.
     fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<Vec<u8>, VerifierError>;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Algorithm registry
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve an algorithm string (e.g. `"Dilithium-3"`) into
+/// `(base_algorithm_name, signature_byte_length)`.
+///
+/// Matches Python's `handle_signature_algorithm_type`:
+///
+/// ```python
+/// data_string = algorithm.split("-")
+/// alg = data_string[0]          # "Dilithium"
+/// level = data_string[1]        # "3"
+/// length = SIGNATURE_ALG_LENGTHS[alg][int(level)]   # 3293
+/// ```
+pub fn resolve_alg_and_length(algorithm_str: &str) -> Result<(String, usize), VerifierError> {
+    let mut parts = algorithm_str.splitn(2, '-');
+    let alg = parts.next().unwrap_or("").trim();
+    let level_str = parts.next(); // e.g. "2", "3", "5" for Dilithium
+
+    match alg {
+        "RSA" => Ok(("RSA".to_string(), 256)),
+
+        "Ed25519" => Ok(("Ed25519".to_string(), 64)),
+
+        "Dilithium" => {
+            let level: u8 = level_str
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or_else(|| {
+                    VerifierError::UnsupportedAlgorithm(format!(
+                        "Dilithium requires a security level suffix, e.g. 'Dilithium-2'. Got: '{}'",
+                        algorithm_str
+                    ))
+                })?;
+            let sig_len = match level {
+                2 => 2420,
+                3 => 3293,
+                5 => 4595,
+                _ => {
+                    return Err(VerifierError::UnsupportedAlgorithm(format!(
+                        "Unknown Dilithium security level: {}",
+                        level
+                    )))
+                }
+            };
+            Ok(("Dilithium".to_string(), sig_len))
+        }
+
+        other => Err(VerifierError::UnsupportedAlgorithm(other.to_string())),
+    }
+}
+
+/// Infer the Dilithium security level from the public key length.
+///
+/// Matches Python's `LENGTH_SECURITY_LEVEL = { (1312, 2528): 2, ... }` lookup
+/// on the public-key side.
+pub fn dilithium_level_from_pubkey_len(len: usize) -> Option<u8> {
+    match len {
+        1312 => Some(2),
+        1952 => Some(3),
+        2592 => Some(5),
+        _ => None,
+    }
+}
+
+/// Infer the Dilithium security level from the private key length.
+pub fn dilithium_level_from_privkey_len(len: usize) -> Option<u8> {
+    match len {
+        2528 => Some(2),
+        4000 => Some(3),
+        4864 => Some(5),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_rsa() {
+        let (alg, len) = resolve_alg_and_length("RSA").unwrap();
+        assert_eq!(alg, "RSA");
+        assert_eq!(len, 256);
+    }
+
+    #[test]
+    fn resolve_ed25519() {
+        let (alg, len) = resolve_alg_and_length("Ed25519").unwrap();
+        assert_eq!(alg, "Ed25519");
+        assert_eq!(len, 64);
+    }
+
+    #[test]
+    fn resolve_dilithium_levels() {
+        assert_eq!(resolve_alg_and_length("Dilithium-2").unwrap(), ("Dilithium".into(), 2420));
+        assert_eq!(resolve_alg_and_length("Dilithium-3").unwrap(), ("Dilithium".into(), 3293));
+        assert_eq!(resolve_alg_and_length("Dilithium-5").unwrap(), ("Dilithium".into(), 4595));
+    }
+
+    #[test]
+    fn resolve_dilithium_no_level_errors() {
+        assert!(resolve_alg_and_length("Dilithium").is_err());
+    }
+
+    #[test]
+    fn resolve_unknown_errors() {
+        assert!(resolve_alg_and_length("ECDSA").is_err());
+    }
+
+    #[test]
+    fn pubkey_level_inference() {
+        assert_eq!(dilithium_level_from_pubkey_len(1312), Some(2));
+        assert_eq!(dilithium_level_from_pubkey_len(1952), Some(3));
+        assert_eq!(dilithium_level_from_pubkey_len(2592), Some(5));
+        assert_eq!(dilithium_level_from_pubkey_len(999), None);
+    }
+}

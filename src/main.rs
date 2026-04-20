@@ -6,7 +6,6 @@ use auth_kademlia::network::Server;
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
 
     let issuer_key_path = PathBuf::from("issuer_node_public_key.txt");
     let handler = Arc::new(DIDSignatureVerifierHandler::new(issuer_key_path));

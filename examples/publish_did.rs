@@ -1,90 +1,44 @@
-# AuthKademlia-RS
-
-A Rust reimplementation of [AuthKademlia](https://github.com/fratrung/AuthKademlia) — an extended Kademlia Distributed Hash Table with native support for **signed records** and **Verifiable Data Registry (VDR)** capabilities for Decentralized Identifiers (DIDs).
-
------
-
-## Overview
-
-AuthKademlia-RS is a high-performance, asynchronous implementation of the [Kademlia DHT protocol](http://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf) written in Rust. It extends the standard Kademlia specification with cryptographic record signing, making it suitable for use as a decentralized identity infrastructure layer.
-
-Unlike conventional DHT implementations, AuthKademlia-RS treats stored values as **verifiable artifacts**: each record is cryptographically bound to its author and can be independently verified by any node in the network — without any central authority.
-
------
-
-## Key Differentiators
-
-|Feature                  |Standard Kademlia|AuthKademlia-RS                     |
-|-------------------------|-----------------|------------------------------------|
-|Record integrity         |None             |Cryptographic signature verification|
-|Identity support         |None             |Native DID Document storage         |
-|Post-quantum cryptography|None             |Dilithium & Kyber key support       |
-|Verifiable Data Registry |None             |Built-in VDR semantics              |
-|Language                 |Various          |Rust (memory-safe, high-performance)|
-
------
-
-## Signed Records and Verifiable Data Registry
-
-Each value stored in the DHT is a **structured signed record** with the following layout:
-
-```
-algorithm (12 bytes) | signature | DID Document (canonical JSON)
-```
-
-This structure allows any peer to:
-
-- Verify the **authenticity** of stored data using the public key embedded in the DID Document
-- Verify the **integrity** of the record against its signature
-- Operate without trusting any single node or coordinator
-
-Signature validation is handled automatically by the integrated verifier at insertion and retrieval time.
-
------
-
-## DID:IIoT Integration
-
-This implementation is designed to interoperate with the [`did:iiot` method](https://github.com/fratrung/did-iiot), an open DID method targeting **Industrial IoT** environments.
-
-DID Documents stored in the DHT embed **post-quantum public keys** (Dilithium for authentication, Kyber for key exchange), enabling:
-
-- Secure device authentication
-- Post-quantum key exchange
-- Verifiable credential issuance and resolution
-
-A complete end-to-end integration example is available at [fratrung/did-iiot-dht](https://github.com/fratrung/did-iiot-dht).
-
------
-
-## Installation
-
-Add the following to your `Cargo.toml`:
-
-```toml
-[dependencies]
-authkademlia-rs = { git = "https://github.com/fratrung/auth_kademlia" }
-```
-
------
-
-## Example
-
-```rust
+/// Example: publish and retrieve a signed DID Document via auth_kademlia.
+///
+/// Rust equivalent of the Python AuthKademlia example:
+///
+///   1. Start a DHT node with signature verification
+///   2. Generate Dilithium + Kyber key pairs
+///   3. Build a did:iiot DID Document
+///   4. Sign it and pack it into the record format:
+///        | algorithm (12 bytes, null-padded) | signature | DID Document (JSON) |
+///   5. Store the signed record in the DHT under the DID's UUID fragment
+///   6. Retrieve and verify it
+///
+/// To run:
+///   cargo run --example publish_did -- --bootstrap 127.0.0.1:5678
+///
+/// If this is the first node in the network, omit --bootstrap.
 use std::sync::Arc;
 use std::path::PathBuf;
 
 use auth_kademlia::auth_handler::DIDSignatureVerifierHandler;
 use auth_kademlia::network::Server;
 
-
+// ─── Post-quantum primitives ──────────────────────────────────────────────────
+// These come from the `pqcrypto` family of crates.
+// Add to Cargo.toml:
+//   pqcrypto-dilithium = "0.5"
+//   pqcrypto-kyber     = "0.8"
+//   pqcrypto-traits    = "0.3"
 use pqcrypto_dilithium::dilithium2;
 use pqcrypto_kyber::kyber512;
 use pqcrypto_traits::sign::{PublicKey, DetachedSignature};
 use pqcrypto_traits::kem::{PublicKey as KemPublicKey};
 
+// ─── Encoding / JSON ──────────────────────────────────────────────────────────
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
 use uuid::Uuid;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Record format helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Encode a raw public key as base64url (no padding).
 fn base64url_encode(pk: &[u8]) -> String {
@@ -146,6 +100,10 @@ fn build_signed_record(
     record
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DID Document builder
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Generate a `did:iiot` URI using a random UUID v4.
 fn generate_did_iiot() -> String {
     format!("did:iiot:{}", Uuid::new_v4())
@@ -197,6 +155,11 @@ fn build_did_document(
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────────────────────
+
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -204,14 +167,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
         let mut server = Server::new(handler, 20, 3, None, None);
         server.listen(port, "127.0.0.1").await.unwrap();
-        println!("Node started on port {}", port);
+        println!("Nodo avviato sulla porta {}", port);
         server
     }
 
     let node_1 = start_node(5678).await;
     let node_2 = start_node(5679).await;
 
-    println!("Node 2: Execute bootstrap to Node 1 (5678)...");
+    println!("Nodo 2: Eseguo bootstrap verso Nodo 1 (5678)...");
     node_2.bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
 
     let (dilithium_pk, dilithium_sk) = dilithium2::keypair();
@@ -222,36 +185,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let signed_record = build_signed_record(&did_doc, &dilithium_sk, "Dilithium-2");
     
-    println!("Node 2: Publish DID {} into DHT", dht_key);
+    println!("Nodo 2: Pubblico il DID {} nella rete", dht_key);
     node_2.set(&dht_key.clone(), signed_record).await;
 
-    println!("Node 1: retrieving record {} from the DHT...", dht_key);
+    println!("Nodo 1: Recupero il record {} dalla rete...", dht_key);
     match node_1.get(&dht_key).await {
         Some(record) => {
-            println!("Node 1: Record found! ({} bytes)", record.len());
+            println!("Nodo 1: Record trovato! ({} bytes)", record.len());
         },
-        None => println!("Node 1: Record not found!"),
+        None => println!("Nodo 1: Record non trovato!"),
     }
 
     Ok(())
 }
-
-```
-
-## Logging
-
-AuthKademlia-RS uses the [`tracing`](https://docs.rs/tracing) ecosystem for structured, level-based logging. To enable debug output:
-
-```rust
-tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::DEBUG)
-    .init();
-```
-
------
-
-## Related Projects
-
-- [AuthKademlia](https://github.com/fratrung/AuthKademlia) — original Python implementation
-- [did:iiot](https://github.com/fratrung/did-iiot) — DID method for Industrial IoT
-- [did-iiot-dht](https://github.com/fratrung/did-iiot-dht) — end-to-end integration example

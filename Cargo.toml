@@ -4,26 +4,45 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio        = { version = "1", features = ["full"] }
-serde        = { version = "1", features = ["derive"] }
-serde_json   = "1"
-sha1         = "0.10"
-rand         = "0.8"
-base64       = "0.21"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rsa          = { version = "0.9", features = ["sha2"] }
-sha2         = "0.10"
-bincode      = "1"
-bytes        = "1"
-log          = "0.4"
-env_logger   = "0.10"
-thiserror    = "1"
-async-trait  = "0.1"
-dashmap      = "5"
-hex          = "0.4"
-anyhow       = "1"
-futures      = "0.3"
-indexmap     = "2"
+# Async runtime
+tokio          = { version = "1", features = ["full"] }
+futures        = "0.3"
+async-trait    = "0.1"
+async-recursion = "1"
+rand_core = "0.10.1"
 
-[features]
-dilithium_oqs = []
+# Serialization
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+bincode        = "1"
+
+# Cryptography / encoding
+sha1               = "0.10"
+sha2               = "0.10"
+base64             = "0.22"
+hex                = "0.4"
+rand               = "0.8"
+# Post-quantum (Dilithium)
+pqcrypto-dilithium = "0.5"
+pqcrypto-traits    = "0.3"
+# Ed25519
+ed25519-dalek      = "2"
+# RSA
+rsa                = { version = "0.9", features = ["sha2"] }
+
+# Data structures
+indexmap       = "2"
+
+# Error handling
+thiserror      = "1"
+
+# Logging
+log            = "0.4"
+
+[dev-dependencies]
+tokio              = { version = "1", features = ["full", "test-util"] }
+env_logger         = "0.11"
+pqcrypto-dilithium = "0.5"
+pqcrypto-kyber     = "0.8"
+pqcrypto-traits    = "0.3"
+uuid               = { version = "1", features = ["v4"] }
