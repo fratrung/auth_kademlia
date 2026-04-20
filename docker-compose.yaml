@@ -1,0 +1,49 @@
+services:
+  seed:
+    build: .
+    container_name: dht_seed
+    environment:
+      - NODE_PORT=5678
+      - IS_SEED=true
+    networks:
+      dht_net:
+        ipv4_address: 172.20.0.10
+    ports:
+      - "5678:5678/udp"
+
+  peer1:
+    build: .
+    container_name: dht_peer_1
+    environment:
+      - NODE_PORT=5679
+      - BOOTSTRAP_ADDR=172.20.0.10:5678 
+    networks:
+      dht_net:
+        ipv4_address: 172.20.0.11
+
+  peer2:
+    build: .
+    container_name: dht_peer_2
+    environment:
+      - NODE_PORT=5680
+      - BOOTSTRAP_ADDR=172.20.0.10:5678
+    networks:
+      dht_net:
+        ipv4_address: 172.20.0.12
+
+  peer3:
+    build: .
+    container_name: dht_peer_3
+    environment:
+      - NODE_PORT=5681
+      - BOOTSTRAP_ADDR=172.20.0.10:5678
+    networks:
+      dht_net:
+        ipv4_address: 172.20.0.13
+        
+networks:
+  dht_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

@@ -18,6 +18,7 @@
 ///
 /// Security level is inferred automatically from the key length,
 /// exactly as in the Python implementation.
+/// 
 use pqcrypto_dilithium::{dilithium2, dilithium3, dilithium5};
 use pqcrypto_traits::sign::{
     DetachedSignature, PublicKey as PQPublicKey, SecretKey as PQSecretKey,
@@ -27,11 +28,6 @@ use crate::crypto::signature_verifier::{
     dilithium_level_from_privkey_len, dilithium_level_from_pubkey_len, Signer,
     SignatureVerifier, VerifierError,
 };
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Verifier
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub struct DilithiumSignatureVerifier;
 
@@ -83,10 +79,6 @@ fn verify_d5(pk: &[u8], sig: &[u8], msg: &[u8]) -> Result<bool, VerifierError> {
         .map_err(|_| VerifierError::VerificationFailed("invalid signature bytes".into()))?;
     Ok(dilithium5::verify_detached_signature(&sig, msg, &pk).is_ok())
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Signer
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub struct DilithiumSigner;
 

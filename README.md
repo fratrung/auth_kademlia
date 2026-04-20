@@ -197,40 +197,98 @@ fn build_did_document(
     })
 }
 
+// Helper function to initialize and start a Kademlia node
+async fn start_node(port: u16) -> Server {
+    // Initialize the signature handler with the issuer's public key
+    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
+        
+    // Create a new Server: ksize=20, alpha=3
+    let mut server = Server::new(handler, 20, 3, None, None);
+        
+    // Start listening on the specified port
+    server.listen(port, "127.0.0.1").await.unwrap();
+    println!(">>> Node started on port {}", port);
+    server
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    async fn start_node(port: u16) -> Server {
-        let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
-        let mut server = Server::new(handler, 20, 3, None, None);
-        server.listen(port, "127.0.0.1").await.unwrap();
-        println!("Node started on port {}", port);
-        server
-    }
-
+    
+    // Start two local nodes
     let node_1 = start_node(5678).await;
     let node_2 = start_node(5679).await;
 
-    println!("Node 2: Execute bootstrap to Node 1 (5678)...");
+    // Node 2 performs bootstrap toward Node 1 to join the network
+    println!(">>> Node 2: Performing bootstrap towards Node 1 (5678)...");
+    let discovered = node_2.bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
+    
+    println!(">>> Node 2 discovered {} nodes during bootstrap", discovered.len());
+    
+    // Fallback logic if initial bootstrap fails
+    if discovered.is_empty() {
+        println!(">>> WARNING: Bootstrap failed, forcing manual retry...");
+        node_2.bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
+    }
+    
+    // Allow some time for the DHT routing tables to update
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     node_2.bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
+    
+    sleep(Duration::from_secs(1)).await;
 
+    // --- Post-Quantum Cryptography Section ---
+    // Generate PQC keypairs (Dilithium for signatures, Kyber for encryption)
     let (dilithium_pk, dilithium_sk) = dilithium2::keypair();
     let (kyber_pk, _) = kyber512::keypair();
+    
+    // Create a unique Decentralized Identifier (DID)
     let did = generate_did_iiot();
     let did_doc = build_did_document(&did, &dilithium_pk, &kyber_pk);
+    
+    // Extract the hash-part of the DID to use as the DHT key
     let dht_key = did.split(':').last().unwrap().to_string();
 
+    // Sign the DID Document using Dilithium-2
     let signed_record = build_signed_record(&did_doc, &dilithium_sk, "Dilithium-2");
     
-    println!("Node 2: Publish DID {} into DHT", dht_key);
-    node_2.set(&dht_key.clone(), signed_record).await;
+    // Retry loop to publish the record (waiting for network stabilization)
+    let mut is_ready = false;
+    for i in 0..10 {
+        let success = node_2.set(&dht_key.clone(), signed_record.clone()).await;
+        
+        if success == Some(true) {
+            println!(">>> Network stabilized and record published on attempt {}!", i + 1);
+            is_ready = true;
+            break;
+        }
+        println!(">>> Attempt {}: Waiting for neighbors in the DHT...", i + 1);
+        sleep(Duration::from_millis(500)).await;
+    }
 
-    println!("Node 1: retrieving record {} from the DHT...", dht_key);
+    if !is_ready {
+        println!(">>> ERROR: Failed to publish the record to the DHT.");
+        return Ok(());
+    }
+
+    println!(">>> Node 1: Retrieving record '{}'...", dht_key);
     match node_1.get(&dht_key).await {
         Some(record) => {
-            println!("Node 1: Record found! ({} bytes)", record.len());
+            println!(">>> Node 1: Record found! ({} bytes)", record.len());
+            
+            // Parse the binary record: [Algorithm Name (12 bytes)] [Signature] [DID Document JSON]
+            let alg_cow = String::from_utf8_lossy(&record[0..12]);
+            let alg = alg_cow.trim_matches(char::from(0)); // Remove null padding
+            let doc_start = 12 + dilithium2::signature_bytes();
+            let doc_bytes = &record[doc_start..];
+            
+            if let Ok(doc) = serde_json::from_slice::<Value>(doc_bytes) {
+                println!(">>> Analysis:");
+                println!("    - Algorithm: {}", alg);
+                println!("    - DID Document ID: {}", doc["id"]);
+                println!("    - Full JSON: {}", serde_json::to_string_pretty(&doc).unwrap());
+            }
         },
-        None => println!("Node 1: Record not found!"),
+        None => println!(">>> Node 1: Record not found!"),
     }
 
     Ok(())

@@ -1,22 +1,6 @@
 /// Base traits, error types, and algorithm registry for signature verification.
-///
-/// Mirrors the Python modules `signature_verifier.py` and `signer.py`:
-///
-/// ```python
-/// SIGNATURE_ALG_LENGTHS = {
-///     "RSA": 256,
-///     "Dilithium": { 2: 2420, 3: 3293, 5: 4595 },
-///     "Ed25519": 64,
-/// }
-/// ```
-///
-/// `resolve_alg_and_length("Dilithium-3")` → `("Dilithium", 3293)`
-/// `resolve_alg_and_length("Ed25519")`     → `("Ed25519", 64)`
-use thiserror::Error;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Error type
-// ─────────────────────────────────────────────────────────────────────────────
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum VerifierError {
@@ -30,11 +14,7 @@ pub enum VerifierError {
     VerificationFailed(String),
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Traits
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Stateless signature verifier — equivalent to Python's `SignatureVerifier` ABC.
+/// Stateless signature verifier
 pub trait SignatureVerifier: Send + Sync {
     /// Return `true` if `signature` over `message` is valid for `public_key`.
     fn verify(
@@ -45,27 +25,13 @@ pub trait SignatureVerifier: Send + Sync {
     ) -> Result<bool, VerifierError>;
 }
 
-/// Stateless signer — equivalent to Python's `Signer` ABC.
 pub trait Signer: Send + Sync {
     /// Sign `message` with `private_key` and return the raw signature bytes.
     fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<Vec<u8>, VerifierError>;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Algorithm registry
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Resolve an algorithm string (e.g. `"Dilithium-3"`) into
 /// `(base_algorithm_name, signature_byte_length)`.
-///
-/// Matches Python's `handle_signature_algorithm_type`:
-///
-/// ```python
-/// data_string = algorithm.split("-")
-/// alg = data_string[0]          # "Dilithium"
-/// level = data_string[1]        # "3"
-/// length = SIGNATURE_ALG_LENGTHS[alg][int(level)]   # 3293
-/// ```
 pub fn resolve_alg_and_length(algorithm_str: &str) -> Result<(String, usize), VerifierError> {
     let mut parts = algorithm_str.splitn(2, '-');
     let alg = parts.next().unwrap_or("").trim();
@@ -73,9 +39,7 @@ pub fn resolve_alg_and_length(algorithm_str: &str) -> Result<(String, usize), Ve
 
     match alg {
         "RSA" => Ok(("RSA".to_string(), 256)),
-
         "Ed25519" => Ok(("Ed25519".to_string(), 64)),
-
         "Dilithium" => {
             let level: u8 = level_str
                 .and_then(|s| s.trim().parse().ok())
@@ -104,9 +68,6 @@ pub fn resolve_alg_and_length(algorithm_str: &str) -> Result<(String, usize), Ve
 }
 
 /// Infer the Dilithium security level from the public key length.
-///
-/// Matches Python's `LENGTH_SECURITY_LEVEL = { (1312, 2528): 2, ... }` lookup
-/// on the public-key side.
 pub fn dilithium_level_from_pubkey_len(len: usize) -> Option<u8> {
     match len {
         1312 => Some(2),

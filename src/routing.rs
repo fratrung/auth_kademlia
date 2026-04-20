@@ -223,6 +223,10 @@ impl RoutingTable {
             .position(|b| b.covers(long_id))
             .unwrap_or(self.buckets.len() - 1)
     }
+    
+    pub fn buckets(&self) -> &Vec<KBucket> {
+        &self.buckets
+    }
 }
 
 #[cfg(test)]

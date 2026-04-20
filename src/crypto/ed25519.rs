@@ -22,11 +22,6 @@ use ed25519_dalek::Signer as DalekSigner;
 
 use crate::crypto::signature_verifier::{SignatureVerifier, Signer, VerifierError};
 
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Verifier
-// ─────────────────────────────────────────────────────────────────────────────
-
 pub struct Ed25519SignatureVerifier;
 
 impl SignatureVerifier for Ed25519SignatureVerifier {
@@ -57,10 +52,6 @@ impl SignatureVerifier for Ed25519SignatureVerifier {
         Ok(verifying_key.verify(message, &sig).is_ok())
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Signer
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub struct Ed25519Signer;
 
