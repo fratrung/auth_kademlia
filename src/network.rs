@@ -136,6 +136,7 @@ impl Server {
     /// Returns the k-closest nodes discovered during the initial lookup.
     pub async fn bootstrap(&self, addrs: Vec<(String, u16)>) -> Vec<Node> {
         log::debug!("Bootstrapping with {} initial contacts", addrs.len());
+        println!(">>> Bootstrapping with {} initial contacts", addrs.len());
         let mut futs = vec![];
         for addr in addrs {
             futs.push(self.bootstrap_node(addr));

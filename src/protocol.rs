@@ -6,6 +6,7 @@
 ///
 /// Message framing: every datagram is a `bincode`-encoded `(u32 msg_id, RpcEnvelope)`.
 /// Responses are correlated by `msg_id` via a `PendingMap`.
+/// 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,18 +26,10 @@ use crate::routing::RoutingTable;
 use crate::storage::{ForgetfulStorage, IStorage};
 use crate::utils::{digest, ID_LEN};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Constants
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Timeout for a single RPC call.
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 const STATUS_LIST_KEY: &str = "did:iiot:status-list";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Wire types
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Messages sent over the wire. Each variant corresponds to a Kademlia RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,7 +96,6 @@ pub enum RpcMessage {
     },
 }
 
-/// A compact node representation suitable for wire serialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireNode {
     pub id: [u8; ID_LEN],
@@ -123,24 +115,15 @@ impl From<WireNode> for Node {
     }
 }
 
-/// Framed datagram: `(message_id, payload)`.
 #[derive(Debug, Serialize, Deserialize)]
 struct Frame {
     msg_id: u32,
-    /// `true` for requests, `false` for responses.
     is_request: bool,
     message: RpcMessage,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Pending RPC tracking
-// ─────────────────────────────────────────────────────────────────────────────
-
 type PendingMap = Arc<Mutex<HashMap<u32, oneshot::Sender<RpcMessage>>>>;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// KademliaProtocol
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub struct KademliaProtocol {
     pub router: Arc<Mutex<RoutingTable>>,
@@ -153,7 +136,6 @@ pub struct KademliaProtocol {
 }
 
 impl KademliaProtocol {
-    /// Create a new protocol instance bound to `socket`.
     pub fn new(
         source_node: Node,
         socket: Arc<UdpSocket>,
@@ -173,16 +155,12 @@ impl KademliaProtocol {
         }
     }
 
-    // ─── Message ID allocation ────────────────────────────────────────────────
-
     async fn next_id(&self) -> u32 {
         let mut id = self.next_msg_id.lock().await;
         let out = *id;
         *id = id.wrapping_add(1);
         out
     }
-
-    // ─── Transport helpers ────────────────────────────────────────────────────
 
     /// Send a frame to `addr`.
     async fn send_frame(&self, addr: SocketAddr, frame: &Frame) -> bool {
@@ -230,27 +208,32 @@ impl KademliaProtocol {
     }
 
     /// Parse and dispatch an incoming UDP datagram.
-    ///
     /// Responses are routed to waiting `call()` callers via the pending map.
     /// Requests are handled inline and a response is sent back.
     pub async fn handle_datagram(self: &Arc<Self>, data: Vec<u8>, peer: SocketAddr) {
         let frame: Frame = match bincode::deserialize(&data) {
             Ok(f) => f,
             Err(e) => {
-                log::warn!("Failed to deserialize datagram from {}: {}", peer, e);
+                log::warn!("Failed to deserialize: {}", e);
                 return;
             }
         };
 
         if !frame.is_request {
-            // Route response to the waiting caller.
+            if let RpcMessage::Pong { sender_id } = &frame.message {
+                let source = Node::new(*sender_id, Some(peer.ip().to_string()), Some(peer.port()));
+                let p = Arc::clone(self);
+                tokio::spawn(async move {
+                    p.welcome_if_new(source).await;
+                });
+            }
+            
             if let Some(tx) = self.pending.lock().await.remove(&frame.msg_id) {
                 let _ = tx.send(frame.message);
             }
             return;
         }
 
-        // Dispatch request and send response.
         let response = self.dispatch_request(frame.message, peer).await;
         if let Some(resp) = response {
             let resp_frame = Frame {
@@ -262,7 +245,6 @@ impl KademliaProtocol {
         }
     }
 
-    /// Dispatch an incoming request to the appropriate RPC handler.
     async fn dispatch_request(
         &self,
         msg: RpcMessage,
@@ -316,7 +298,6 @@ impl KademliaProtocol {
         }
     }
 
-    // ─── RPC handlers (incoming) ──────────────────────────────────────────────
 
     pub async fn rpc_ping(
         &self,
@@ -467,7 +448,6 @@ impl KademliaProtocol {
         self.router.lock().await.remove_contact(&source);
     }
 
-    // ─── Outbound RPC calls ───────────────────────────────────────────────────
 
     pub async fn call_ping_addr(&self, addr: &(String, u16)) -> (bool, Vec<u8>) {
         let sock_addr: SocketAddr = match format!("{}:{}", addr.0, addr.1).parse() {
@@ -604,7 +584,6 @@ impl KademliaProtocol {
             .await;
     }
 
-    // ─── Internal helpers ─────────────────────────────────────────────────────
 
     fn verify_for_key(&self, key: &[u8; ID_LEN], value: &[u8]) -> bool {
         let status_list_key = digest(STATUS_LIST_KEY);
@@ -652,7 +631,7 @@ impl KademliaProtocol {
 
                     let should_replicate = farthest_dist
                         .map(|fd| new_dist < fd && self_dist < fd)
-                        .unwrap_or(true); // no neighbors yet → always replicate
+                        .unwrap_or(true); // no neighbors yet -> always replicate
 
                     if should_replicate { Some((key, value)) } else { None }
                 })
@@ -684,18 +663,11 @@ impl KademliaProtocol {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// FindValueResult
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub enum FindValueResult {
     Nodes(Vec<Node>),
     Value(Vec<u8>),
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SpiderProtocol implementation
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[async_trait]
 impl SpiderProtocol for KademliaProtocol {

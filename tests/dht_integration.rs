@@ -128,18 +128,18 @@ fn build_did_document(
         ]
     })
 }
-
 #[cfg(test)]
 mod tests {
-    use super::*; // Importa le funzioni di utilità che hai già scritto
+    use super::*; 
     use tokio::time::{sleep, Duration};
 
     #[tokio::test]
-    async fn test_dht_publish_and_retrieve() {
-        // 1. Inizializza 3 nodi su porte diverse
+    async fn test_dht_publish_and_retrieve_detailed() {
+        println!("\n--- Inizio Test DHT: Publish & Retrieve ---");
+
+        // 1. Inizializza 3 nodi
         let mut nodes = Vec::new();
         let ports = [5678, 5679, 5680];
-
         for port in &ports {
             let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer_pub_key.bin")));
             let mut server = Server::new(handler, 20, 3, None, None);
@@ -147,29 +147,42 @@ mod tests {
             nodes.push(server);
         }
 
-        // 2. Bootstrap: nodo B(5679) e C(5680) si connettono ad A(5678)
+        // 2. Bootstrap
         nodes[1].bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
         nodes[2].bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
-        
-        // Attendi un momento che la rete si stabilizzi
         sleep(Duration::from_secs(1)).await;
+        println!("Stato rete: 3 nodi pronti.");
 
-        // 3. Genera chiavi e DID
         let (dilithium_pk, dilithium_sk) = dilithium2::keypair();
         let (kyber_pk, _) = kyber512::keypair();
         let did = generate_did_iiot();
         let did_doc = build_did_document(&did, &dilithium_pk, &kyber_pk);
         let dht_key = did.split(':').last().unwrap().to_string();
-
-        // 4. Pubblica dal nodo B
-        let signed_record = build_signed_record(&did_doc, &dilithium_sk, "Dilithium-2");
-        let store_result = nodes[1].set(&dht_key.clone(), signed_record).await;
-        assert!(store_result.unwrap_or(false), "Il salvataggio dovrebbe avere successo");
-
-        // 5. Recupera dal nodo C
-        let retrieved = nodes[2].get(&dht_key).await;
-        assert!(retrieved.is_some(), "Il record dovrebbe essere presente nella DHT");
         
-        println!("Test completato con successo!");
+        let signed_record = build_signed_record(&did_doc, &dilithium_sk, "Dilithium-2");
+        println!("Nodo 2: Record pronto per il set(). Dimensione totale: {} bytes", signed_record.len());
+
+        let store_result = nodes[1].set(&dht_key, signed_record.clone()).await;
+        assert!(store_result.unwrap_or(false), "Il salvataggio dovrebbe avere successo");
+        println!("Nodo 2: Record salvato con successo sotto la chiave: {}", dht_key);
+
+        println!("Nodo 3: Recupero record dalla chiave: {}", dht_key);
+        let retrieved = nodes[2].get(&dht_key).await.expect("Il record dovrebbe essere presente");
+        
+        println!("Nodo 3: Record ricevuto! Lunghezza totale: {} bytes", retrieved.len());
+        
+        let binding = String::from_utf8_lossy(&retrieved[0..12]);
+        let alg = binding.trim_matches(char::from(0));
+        let sig = &retrieved[12..12 + dilithium2::signature_bytes()];
+        let doc_bytes = &retrieved[12 + dilithium2::signature_bytes()..];
+        
+        println!("  -> Algoritmo estratto: {}", alg);
+        println!("  -> Firma estratta: {} bytes", sig.len());
+        
+        let decoded_doc: Value = serde_json::from_slice(doc_bytes).expect("Errore parsing JSON");
+        println!("  -> Documento DID recuperato: {}", serde_json::to_string_pretty(&decoded_doc).unwrap());
+
+        assert_eq!(decoded_doc["id"], did, "L'ID nel DID Document recuperato non corrisponde!");
+        println!("--- Test completato con successo! ---\n");
     }
 }
