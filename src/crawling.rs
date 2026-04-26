@@ -14,9 +14,6 @@ use log;
 use crate::node::{Node, NodeHeap};
 use crate::utils::ID_LEN;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RPC response types
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Raw tuple returned by a protocol `call_find_*` method:
 /// `(response_received, payload)`.
@@ -34,10 +31,6 @@ pub enum FindPayload {
     Empty,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RPCFindResponse — ergonomic wrapper around RawResponse
-// ─────────────────────────────────────────────────────────────────────────────
-
 pub struct RPCFindResponse {
     response: RawResponse,
 }
@@ -47,7 +40,6 @@ impl RPCFindResponse {
         Self { response }
     }
 
-    /// Did the remote peer respond at all?
     pub fn happened(&self) -> bool {
         self.response.0
     }

@@ -10,10 +10,6 @@ use std::ops::RangeInclusive;
 
 use crate::node::Node;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// KBucket
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// A single K-bucket covering a contiguous range of the XOR keyspace.
 pub struct KBucket {
     /// The inclusive range `[lo, hi]` of `long_id` values this bucket covers.
@@ -88,12 +84,6 @@ impl KBucket {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RoutingTable
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Kademlia routing table.
-///
 /// Maintains a list of K-buckets that together partition the entire 128-bit
 /// XOR keyspace. Buckets are split when they are full *and* cover the local
 /// node's ID, so the table has high resolution near the local node.
@@ -114,7 +104,6 @@ impl RoutingTable {
         Self { node, ksize, buckets: vec![bucket] }
     }
 
-    // ── Contact management ───────────────────────────────────────────────────
 
     /// Add a contact to the routing table.
     ///
@@ -155,7 +144,6 @@ impl RoutingTable {
         !self.buckets[idx].contains(node)
     }
 
-    // ── Lookup ───────────────────────────────────────────────────────────────
 
     /// Return the `k` nodes closest to `target`, optionally excluding one node.
     ///
@@ -179,7 +167,6 @@ impl RoutingTable {
         self.buckets.iter().filter(|b| b.is_lonely()).collect()
     }
 
-    // ── Bucket splitting ─────────────────────────────────────────────────────
 
     /// Split bucket at `idx` into two equal halves.
     ///
@@ -210,7 +197,6 @@ impl RoutingTable {
         self.buckets.insert(idx, low_bucket);
     }
 
-    // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Return the index of the bucket whose range contains `long_id`.
     ///

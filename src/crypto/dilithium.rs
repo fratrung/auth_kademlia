@@ -3,7 +3,7 @@
 /// Mirrors Python's `DilithiumSignatureVerifier` and `DilithiumSigner`:
 ///
 /// ```python
-/// LENGTH_SECURITY_LEVEL = { (1312, 2528): 2, (1952, 4000): 3, (2592, 4864): 5 }
+/// LENGTH_SECURITY_LEVEL = { (1312, 2560): 2, (1952, 4032): 3, (2592, 4896): 5 }
 ///
 /// class DilithiumSignatureVerifier:
 ///     def verify(public_key, signature, message):
@@ -86,9 +86,9 @@ impl Signer for DilithiumSigner {
     /// Sign `message` with a Dilithium private key.
     ///
     /// The security level is inferred from `private_key.len()`:
-    /// - 2528 bytes → Dilithium2
-    /// - 4000 bytes → Dilithium3
-    /// - 4864 bytes → Dilithium5
+    /// - 2560 bytes → Dilithium2
+    /// - 4032 bytes → Dilithium3
+    /// - 4896 bytes → Dilithium5
     fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<Vec<u8>, VerifierError> {
         let level = dilithium_level_from_privkey_len(private_key.len())
             .ok_or(VerifierError::InvalidKeyLength(private_key.len()))?;

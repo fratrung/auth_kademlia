@@ -80,9 +80,9 @@ pub fn dilithium_level_from_pubkey_len(len: usize) -> Option<u8> {
 /// Infer the Dilithium security level from the private key length.
 pub fn dilithium_level_from_privkey_len(len: usize) -> Option<u8> {
     match len {
-        2528 => Some(2),
-        4000 => Some(3),
-        4864 => Some(5),
+        2560 => Some(2),
+        4032 => Some(3),
+        4896 => Some(5),
         _ => None,
     }
 }

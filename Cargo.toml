@@ -3,10 +3,21 @@ name = "auth-kademlia-rs"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+# cdylib  → Python extension (.so / .pyd) built by maturin
+# rlib    → Rust library used by `cargo test` and examples
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "dht_node"
 path = "scripts/dht_node.rs"
+
+[features]
+default = []
+# Build the Python extension module:
+#   maturin develop --features python
+#   maturin build   --features python
+python = ["dep:pyo3", "pyo3/extension-module", "dep:pyo3-asyncio"]
 
 [dependencies]
 # Async runtime
@@ -16,7 +27,6 @@ async-trait    = "0.1"
 async-recursion = "1"
 rand_core = "0.10.1"
 uuid               = { version = "1", features = ["v4"] }
-
 
 # Serialization
 serde          = { version = "1", features = ["derive"] }
@@ -35,7 +45,7 @@ pqcrypto-dilithium = "0.5"
 pqcrypto-kyber     = "0.8"
 pqcrypto-traits    = "0.3"
 # Ed25519
-ed25519-dalek      = "2"
+ed25519-dalek      = { version = "2", features = ["rand_core"] }
 # RSA
 rsa                = { version = "0.9", features = ["sha2"] }
 
@@ -48,10 +58,12 @@ thiserror      = "1"
 # Logging
 log            = "0.4"
 
+# Python binding (optional — only compiled with --features python)
+pyo3        = { version = "0.20", optional = true }
+pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"], optional = true }
+
 [dev-dependencies]
 tokio              = { version = "1", features = ["full", "test-util"] }
 env_logger         = "0.11"
 pqcrypto-dilithium = "0.5"
-
 pqcrypto-traits    = "0.3"
-

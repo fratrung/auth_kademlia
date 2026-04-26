@@ -70,7 +70,6 @@ impl Server {
         }
     }
 
-    // ─── Lifecycle ────────────────────────────────────────────────────────────
 
     /// Bind to `interface:port` and start the UDP receive loop.
     pub async fn listen(&mut self, port: u16, interface: &str) -> tokio::io::Result<()> {
@@ -129,7 +128,6 @@ impl Server {
         }
     }
 
-    // ─── Bootstrap ────────────────────────────────────────────────────────────
 
     /// Bootstrap the node by contacting a list of known peers.
     ///
@@ -174,7 +172,6 @@ impl Server {
         Some(Node::new(id, Some(addr.0), Some(addr.1)))
     }
 
-    // ─── Public DHT API ───────────────────────────────────────────────────────
 
     /// Look up `key` in the DHT.
     ///
@@ -292,8 +289,6 @@ impl Server {
         let dkey = digest(key);
         Some(self.delete_digest(dkey, auth_signature, delete_msg).await)
     }
-
-    // ─── Digest-level operations ──────────────────────────────────────────────
 
     async fn set_digest(&self, dkey: [u8; ID_LEN], value: Vec<u8>) -> bool {
         let proto = match &self.protocol {
@@ -434,8 +429,6 @@ impl Server {
         futures::future::join_all(futs).await.iter().any(|&r| r)
     }
 
-    // ─── Signature dispatch helpers ───────────────────────────────────────────
-
     fn verify_value(&self, key: &str, value: &[u8]) -> bool {
         if key == STATUS_LIST_KEY {
             let ok = self
@@ -453,7 +446,6 @@ impl Server {
         }
     }
 
-    // ─── State persistence ────────────────────────────────────────────────────
 
     /// Return the addresses of bootstrappable neighbour nodes.
     pub async fn bootstrappable_neighbors(&self) -> Vec<(String, u16)> {
@@ -525,7 +517,6 @@ impl Server {
         }
     }
 
-    // ─── Background refresh ───────────────────────────────────────────────────
 
     fn schedule_refresh(&mut self) {
         let proto = match &self.protocol {

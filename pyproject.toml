@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "authkademlia-rs"
+version = "0.1.0"
+description = "Python bindings for the AuthKademlia DHT — signed records and VDR support"
+requires-python = ">=3.8"
+
+[tool.maturin]
+# Activate the Rust feature that enables PyO3 and pyo3-asyncio
+features = ["python"]
+# Python module name must match the #[pymodule] fn name in py_bindings.rs
+module-name = "authkademlia_py"
