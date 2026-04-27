@@ -62,7 +62,6 @@ fn build_signed_record(
     let copy_len = alg_bytes.len().min(12);
     alg_field[..copy_len].copy_from_slice(&alg_bytes[..copy_len]);
 
-    // Sign using the detached API — returns only the signature bytes.
     let detached_sig = dilithium2::detached_sign(&doc_bytes, secret_key);
     let signature = detached_sig.as_bytes();
 
