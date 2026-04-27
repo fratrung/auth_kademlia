@@ -59,8 +59,9 @@ thiserror      = "1"
 log            = "0.4"
 
 # Python binding (optional — only compiled with --features python)
-pyo3        = { version = "0.20", optional = true }
+pyo3         = { version = "0.20", optional = true, features = ["extension-module"] }
 pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"], optional = true }
+pyo3-macros = "0.28.3"
 
 [dev-dependencies]
 tokio              = { version = "1", features = ["full", "test-util"] }

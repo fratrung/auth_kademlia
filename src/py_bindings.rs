@@ -1,3 +1,4 @@
+#![allow(non_local_definitions)]
 //! Python bindings for the AuthKademlia DHT server.
 //!
 //! Exposes the high-level [`Server`] struct as a Python class named `Server`
@@ -33,6 +34,7 @@
 //! asyncio.run(main())
 //! ```
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -41,7 +43,15 @@ use pyo3::prelude::*;
 use tokio::sync::RwLock;
 
 use crate::auth_handler::{DIDSignatureVerifierHandler, SignatureVerifierHandler};
+use crate::crypto::key_manager::{
+    DilithiumKeyManager, Ed25519KeyManager, KeyManager, KeyManagerError, KyberKeyManager,
+};
 use crate::network::Server;
+
+fn km_err(e: KeyManagerError) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
+}
+
 
 /// Async DHT server exposed to Python.
 ///
@@ -284,6 +294,180 @@ impl PyServer {
 }
 
 
+
+/// CRYSTALS-Dilithium key manager exposed to Python.
+///
+/// Args:
+///     keys_dir (str): Directory where ``.public`` / ``.private`` files are stored.
+///     security_level (int): 2, 3, or 5.
+#[pyclass(name = "DilithiumKeyManager")]
+pub struct PyDilithiumKeyManager {
+    inner: DilithiumKeyManager,
+}
+
+#[pymethods]
+impl PyDilithiumKeyManager {
+    #[new]
+    fn new(keys_dir: String, security_level: u8) -> Self {
+        Self { inner: DilithiumKeyManager::new(PathBuf::from(keys_dir), security_level) }
+    }
+
+    /// Generate a fresh ``(public_key, private_key)`` pair.
+    ///
+    /// Args:
+    ///     security_level (int | None): Override the instance level (2, 3, or 5).
+    ///                                  If omitted, the level set at construction is used.
+    #[pyo3(signature = (security_level=None))]
+    fn generate_keypair(&self, security_level: Option<u8>) -> PyResult<(Vec<u8>, Vec<u8>)> {
+        let level = security_level.unwrap_or(self.inner.security_level);
+        DilithiumKeyManager::new(self.inner.keys_dir.clone(), level)
+            .generate_keypair()
+            .map_err(km_err)
+    }
+
+    fn store_public_key(&self, key_name: String, public_key: Vec<u8>) -> PyResult<()> {
+        self.inner.store_public_key(&key_name, &public_key).map_err(km_err)
+    }
+
+    fn store_private_key(&self, key_name: String, private_key: Vec<u8>) -> PyResult<()> {
+        self.inner.store_private_key(&key_name, &private_key).map_err(km_err)
+    }
+
+    fn get_public_key(&self, key_name: String) -> PyResult<Vec<u8>> {
+        self.inner.get_public_key(&key_name).map_err(km_err)
+    }
+
+    fn get_private_key(&self, key_name: String) -> PyResult<Vec<u8>> {
+        self.inner.get_private_key(&key_name).map_err(km_err)
+    }
+
+    /// Return a JWK-style ``dict`` for ``public_key``.
+    fn get_jose_format(&self, public_key: Vec<u8>) -> HashMap<String, String> {
+        self.inner.get_jose_format(&public_key)
+    }
+
+    /// Sign ``message`` with ``private_key``. Returns raw signature bytes.
+    fn sign(&self, private_key: Vec<u8>, message: Vec<u8>) -> PyResult<Vec<u8>> {
+        self.inner.sign(&private_key, &message).map_err(km_err)
+    }
+
+    /// Verify ``signature`` over ``message`` against ``public_key``.
+    fn verify_signature(
+        &self,
+        public_key: Vec<u8>,
+        message: Vec<u8>,
+        signature: Vec<u8>,
+    ) -> PyResult<bool> {
+        self.inner.verify_signature(&public_key, &message, &signature).map_err(km_err)
+    }
+}
+
+
+/// CRYSTALS-Kyber key manager exposed to Python.
+///
+/// Kyber is a KEM (Key Encapsulation Mechanism), not a signature scheme.
+///
+/// Args:
+///     keys_dir (str): Directory for key files.
+///     security_level (int): 512, 768, or 1024.
+#[pyclass(name = "KyberKeyManager")]
+pub struct PyKyberKeyManager {
+    inner: KyberKeyManager,
+}
+
+#[pymethods]
+impl PyKyberKeyManager {
+    #[new]
+    fn new(keys_dir: String, security_level: u16) -> Self {
+        Self { inner: KyberKeyManager::new(PathBuf::from(keys_dir), security_level) }
+    }
+
+    /// Args:
+    ///     security_level (int | None): Override the instance level (512, 768, or 1024).
+    #[pyo3(signature = (security_level=None))]
+    fn generate_keypair(&self, security_level: Option<u16>) -> PyResult<(Vec<u8>, Vec<u8>)> {
+        let level = security_level.unwrap_or(self.inner.security_level);
+        KyberKeyManager::new(self.inner.keys_dir.clone(), level)
+            .generate_keypair()
+            .map_err(km_err)
+    }
+
+    fn store_public_key(&self, key_name: String, public_key: Vec<u8>) -> PyResult<()> {
+        self.inner.store_public_key(&key_name, &public_key).map_err(km_err)
+    }
+
+    fn store_private_key(&self, key_name: String, private_key: Vec<u8>) -> PyResult<()> {
+        self.inner.store_private_key(&key_name, &private_key).map_err(km_err)
+    }
+
+    fn get_public_key(&self, key_name: String) -> PyResult<Vec<u8>> {
+        self.inner.get_public_key(&key_name).map_err(km_err)
+    }
+
+    fn get_private_key(&self, key_name: String) -> PyResult<Vec<u8>> {
+        self.inner.get_private_key(&key_name).map_err(km_err)
+    }
+
+    fn get_jose_format(&self, public_key: Vec<u8>) -> HashMap<String, String> {
+        self.inner.get_jose_format(&public_key)
+    }
+}
+
+
+/// Ed25519 key manager exposed to Python.
+///
+/// Args:
+///     keys_dir (str): Directory for key files.
+#[pyclass(name = "Ed25519KeyManager")]
+pub struct PyEd25519KeyManager {
+    inner: Ed25519KeyManager,
+}
+
+#[pymethods]
+impl PyEd25519KeyManager {
+    #[new]
+    fn new(keys_dir: String) -> Self {
+        Self { inner: Ed25519KeyManager::new(PathBuf::from(keys_dir)) }
+    }
+
+    fn generate_keypair(&self) -> PyResult<(Vec<u8>, Vec<u8>)> {
+        self.inner.generate_keypair().map_err(km_err)
+    }
+
+    fn store_public_key(&self, key_name: String, public_key: Vec<u8>) -> PyResult<()> {
+        self.inner.store_public_key(&key_name, &public_key).map_err(km_err)
+    }
+
+    fn store_private_key(&self, key_name: String, private_key: Vec<u8>) -> PyResult<()> {
+        self.inner.store_private_key(&key_name, &private_key).map_err(km_err)
+    }
+
+    fn get_public_key(&self, key_name: String) -> PyResult<Vec<u8>> {
+        self.inner.get_public_key(&key_name).map_err(km_err)
+    }
+
+    fn get_private_key(&self, key_name: String) -> PyResult<Vec<u8>> {
+        self.inner.get_private_key(&key_name).map_err(km_err)
+    }
+
+    fn get_jose_format(&self, public_key: Vec<u8>) -> HashMap<String, String> {
+        self.inner.get_jose_format(&public_key)
+    }
+
+    fn sign(&self, private_key: Vec<u8>, message: Vec<u8>) -> PyResult<Vec<u8>> {
+        self.inner.sign(&private_key, &message).map_err(km_err)
+    }
+
+    fn verify_signature(
+        &self,
+        public_key: Vec<u8>,
+        message: Vec<u8>,
+        signature: Vec<u8>,
+    ) -> PyResult<bool> {
+        self.inner.verify_signature(&public_key, &message, &signature).map_err(km_err)
+    }
+}
+
 /// Python module entry point.
 ///
 /// The function name **must** match the desired module name so that Python
@@ -293,5 +477,8 @@ impl PyServer {
 #[pymodule]
 fn authkademlia_py(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyServer>()?;
+    m.add_class::<PyDilithiumKeyManager>()?;
+    m.add_class::<PyKyberKeyManager>()?;
+    m.add_class::<PyEd25519KeyManager>()?;
     Ok(())
 }
