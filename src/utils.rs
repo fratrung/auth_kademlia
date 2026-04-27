@@ -9,9 +9,6 @@ use std::future::Future;
 /// Byte length of a Kademlia node ID (SHA-1 output = 20 bytes = 160 bits).
 pub const ID_LEN: usize = 20;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Digest helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Compute the SHA-1 digest of a UTF-8 string.
 pub fn digest(s: &str) -> [u8; ID_LEN] {
@@ -24,10 +21,6 @@ pub fn digest_bytes(data: &[u8]) -> [u8; ID_LEN] {
     hasher.update(data);
     hasher.finalize().into()
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Async concurrency helper
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Run all futures in `dic` concurrently and return a `HashMap` mapping
 /// each key to its future's output.
@@ -44,9 +37,6 @@ where
     keys.into_iter().zip(results).collect()
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Bit-level helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Return the longest common byte prefix shared by all slices in `args`.
 pub fn shared_prefix(args: &[&[u8]]) -> Vec<u8> {

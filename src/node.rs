@@ -9,10 +9,6 @@ use std::fmt;
 
 use crate::utils::ID_LEN;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Node
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// A Kademlia peer node.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Node {
@@ -89,10 +85,6 @@ impl fmt::Display for Node {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NodeHeap internals
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// An entry in the heap, ordered by XOR distance (ascending).
 ///
 /// `BinaryHeap` in Rust is a max-heap, so we invert the ordering so that the
@@ -127,9 +119,6 @@ impl Ord for HeapEntry {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NodeHeap
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// A bounded min-heap of nodes ordered by XOR distance from a pivot node.
 ///
@@ -158,7 +147,6 @@ impl NodeHeap {
         }
     }
 
-    // ── Insertion ────────────────────────────────────────────────────────────
 
     /// Insert a batch of nodes, ignoring duplicates.
     ///
@@ -191,7 +179,6 @@ impl NodeHeap {
         self.heap = entries.into_iter().collect();
     }
 
-    // ── Removal ──────────────────────────────────────────────────────────────
 
     /// Remove nodes by ID.
     pub fn remove(&mut self, peers: &[[u8; ID_LEN]]) {
@@ -212,7 +199,6 @@ impl NodeHeap {
         self.heap.pop().map(|e| e.node)
     }
 
-    // ── Queries ──────────────────────────────────────────────────────────────
 
     /// Return `true` if the node is already in the heap.
     pub fn contains(&self, node: &Node) -> bool {
@@ -246,7 +232,6 @@ impl NodeHeap {
         self.heap.is_empty()
     }
 
-    // ── Contact tracking ─────────────────────────────────────────────────────
 
     /// Mark a node as contacted so it is excluded from future crawl rounds.
     pub fn mark_contacted(&mut self, node: &Node) {
@@ -260,7 +245,6 @@ impl NodeHeap {
             .collect()
     }
 
-    // ── Iteration ────────────────────────────────────────────────────────────
 
     /// Iterate over nodes in ascending XOR-distance order, limited to `maxsize`.
     pub fn iter(&self) -> impl Iterator<Item = Node> + '_ {

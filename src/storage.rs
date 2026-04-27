@@ -10,10 +10,6 @@ use std::time::{Duration, Instant};
 /// One week in seconds — the default TTL used in AuthKademlia.
 pub const DEFAULT_TTL: i64 = 604_800;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// IStorage trait
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Abstract key-value store interface.
 ///
 /// Keys and values are raw byte vectors. Implementations must be `Send + Sync`
@@ -41,10 +37,6 @@ pub trait IStorage: Send + Sync {
     fn iter_all(&self) -> Vec<(Vec<u8>, Vec<u8>)>;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal entry
-// ─────────────────────────────────────────────────────────────────────────────
-
 struct StorageEntry {
     value: Vec<u8>,
     inserted_at: Instant,
@@ -59,10 +51,6 @@ impl StorageEntry {
         self.inserted_at.elapsed()
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ForgetfulStorage
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// An insertion-ordered store that evicts entries older than `ttl` seconds.
 ///
@@ -89,8 +77,6 @@ impl ForgetfulStorage {
     pub fn new(ttl: i64) -> Self {
         Self { data: IndexMap::new(), ttl }
     }
-
-    // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Remove all entries that have exceeded the TTL.
     ///

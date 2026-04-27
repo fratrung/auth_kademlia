@@ -76,9 +76,6 @@ impl RPCFindResponse {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SpiderProtocol — dependency-injection interface
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// The subset of the Kademlia protocol needed by the spider crawl.
 ///
@@ -89,10 +86,6 @@ pub trait SpiderProtocol: Send + Sync {
     async fn call_find_value(&self, peer: &Node, target: &Node) -> RawResponse;
     async fn call_store(&self, peer: &Node, key: [u8; ID_LEN], value: Vec<u8>) -> bool;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SpiderCrawl — shared state and round driver
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Shared state for iterative Kademlia lookups.
 pub struct SpiderCrawl<P: SpiderProtocol> {
@@ -183,10 +176,6 @@ impl<P: SpiderProtocol> SpiderCrawl<P> {
             .collect()
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ValueSpiderCrawl
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Iterative lookup that terminates when a value is found or the network is
 /// exhausted.
@@ -289,10 +278,6 @@ impl<P: SpiderProtocol + 'static> ValueSpiderCrawl<P> {
         Some(value)
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// NodeSpiderCrawl
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Iterative lookup that returns the k closest nodes to a target.
 pub struct NodeSpiderCrawl<P: SpiderProtocol> {

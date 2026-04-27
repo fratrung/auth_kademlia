@@ -16,10 +16,6 @@ use thiserror::Error;
 use crate::crypto::factory::SignatureVerifierFactory;
 use crate::crypto::signature_verifier::{resolve_alg_and_length, VerifierError};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Error type
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Error)]
 pub enum AuthHandlerError {
     #[error("crypto error: {0}")]
@@ -37,10 +33,6 @@ pub enum AuthHandlerError {
     #[error("invalid record format")]
     InvalidFormat,
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Trait
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Abstract handler for signature operations performed by the DHT.
 ///
@@ -79,10 +71,6 @@ pub trait SignatureVerifierHandler: Send + Sync {
         value: &[u8],
     ) -> Result<bool, AuthHandlerError>;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Record format helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Parse the algorithm string from the first 12 bytes of a record.
 ///
@@ -133,9 +121,6 @@ fn public_key_from_did_doc(data: &[u8]) -> Result<Vec<u8>, AuthHandlerError> {
     decode_b64url(x)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DIDSignatureVerifierHandler
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Concrete handler that verifies Dilithium-signed DID Document records.
 pub struct DIDSignatureVerifierHandler {
@@ -153,7 +138,6 @@ impl DIDSignatureVerifierHandler {
         Self { issuer_pub_key_path: issuer_pub_key_path.into() }
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────────
 
     fn load_issuer_pub_key(&self) -> Result<Vec<u8>, AuthHandlerError> {
         Ok(std::fs::read(&self.issuer_pub_key_path)?)
