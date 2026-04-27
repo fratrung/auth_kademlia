@@ -8,6 +8,7 @@ pub mod protocol;
 pub mod network;
 pub mod auth_handler;
 pub mod crypto;
+pub mod fragmentation;
 
 
 #[cfg(feature = "python")]

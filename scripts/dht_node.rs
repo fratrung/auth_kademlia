@@ -111,7 +111,7 @@ fn build_did_document(
 
 /// Decode a signed record and return the pretty-printed DID Document JSON.
 fn decode_record(record: &[u8]) -> Option<String> {
-    // layout: [12 B alg][2420 B Dilithium-2 sig][JSON…]
+    // layout: [12 B alg] | [2420 B Dilithium-2 sig] | [DID Document JSON]
     const SIG_LEN: usize = 2420;
     if record.len() < 12 + SIG_LEN {
         return None;
@@ -126,7 +126,6 @@ fn decode_record(record: &[u8]) -> Option<String> {
     serde_json::to_string_pretty(&doc).ok()
 }
 
-// ─── node factory ───────────────────────────────────────────────────────────
 
 async fn start_server(port: u16) -> Server {
     let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
@@ -162,7 +161,6 @@ async fn bootstrap_with_retries(server: &Server, ip: &str, port: u16) -> bool {
     false
 }
 
-// ─── publisher ──────────────────────────────────────────────────────────────
 
 async fn run_publisher(server: &Server) {
     let uuid = std::env::var("FIXED_DID_UUID")
@@ -229,7 +227,6 @@ async fn run_publisher(server: &Server) {
     );
 }
 
-// ─── retriever ──────────────────────────────────────────────────────────────
 
 async fn run_retriever(server: &Server) {
     let key = match std::env::var("RETRIEVE_KEY") {
@@ -279,7 +276,6 @@ async fn run_retriever(server: &Server) {
     );
 }
 
-// ─── main ───────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -298,12 +294,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut server = start_server(port).await;
 
-    // ── seed ─────────────────────────────────────────────────────────────────
     if std::env::var("IS_SEED").is_ok() {
         log::info!("Running as SEED node — no bootstrap required");
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    // ── peer ─────────────────────────────────────────────────────────────────
     } else if let Ok(addr) = std::env::var("BOOTSTRAP_ADDR") {
         let parts: Vec<&str> = addr.splitn(2, ':').collect();
         if parts.len() != 2 {
@@ -325,7 +319,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log::warn!("Neither IS_SEED nor BOOTSTRAP_ADDR is set — running as isolated node");
     }
 
-    // ── role dispatch ─────────────────────────────────────────────────────────
     match role.as_str() {
         "retriever" => run_retriever(&server).await,
         _ => run_publisher(&server).await,

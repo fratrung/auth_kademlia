@@ -398,11 +398,19 @@ impl Server {
             Some(p) => p,
             None => return false,
         };
+
+        // Always delete locally first — the caller has already verified the
+        // signature and confirmed the record exists. Remote propagation is
+        // best-effort: in a 2-node case the remote peer may never have stored
+        // the record locally (because it was farther from the key), so a
+        // failing remote RPC must not count as a failed delete overall.
+        self.storage.lock().await.delete(&dkey);
+
         let node = Node::from_id(dkey);
         let nearest = proto.router.lock().await.find_neighbors(&node, None);
         if nearest.is_empty() {
-            log::warn!("delete_digest {}: no neighbours", hex::encode(dkey));
-            return false;
+            log::warn!("delete_digest {}: no neighbours, local delete only", hex::encode(dkey));
+            return true;
         }
 
         let nodes = NodeSpiderCrawl::new(
@@ -415,8 +423,7 @@ impl Server {
         .find()
         .await;
 
-        log::info!("delete_digest {}: removing from {} nodes", hex::encode(dkey), nodes.len());
-        self.storage.lock().await.delete(&dkey);
+        log::info!("delete_digest {}: propagating to {} nodes", hex::encode(dkey), nodes.len());
 
         let mut futs = vec![];
         for n in &nodes {
@@ -426,7 +433,8 @@ impl Server {
             let msg = delete_msg.clone();
             futs.push(async move { p.call_delete_rpc(&n, dkey, sig, msg).await });
         }
-        futures::future::join_all(futs).await.iter().any(|&r| r)
+        futures::future::join_all(futs).await;
+        true
     }
 
     fn verify_value(&self, key: &str, value: &[u8]) -> bool {
