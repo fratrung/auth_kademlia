@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use log;
@@ -30,6 +30,134 @@ use crate::utils::{digest, ID_LEN};
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 const STATUS_LIST_KEY: &str = "did:iiot:status-list";
+
+// ---------------------------------------------------------------------------
+// Application-level fragmentation
+// ---------------------------------------------------------------------------
+//
+// Post-quantum signed records (Dilithium-2 signature alone is 2420 bytes,
+// plus the JSON DID Document with base64-encoded Kyber/Dilithium public keys)
+// routinely produce UDP payloads of ~6 KB. Relying on kernel-level IP
+// fragmentation is unreliable on UDP: losing a single fragment causes the
+// whole datagram to be silently dropped, and middleboxes often filter
+// fragmented IP traffic. We therefore implement explicit, application-level
+// fragmentation so that every wire packet stays well below the Ethernet MTU.
+//
+// Wire format of every UDP datagram sent by this module:
+//
+//   [magic: 4][frag_id: u32][index: u16][total: u16][payload...]
+//
+// All multi-byte integers are big-endian. `magic` lets the receiver detect
+// stray non-fragmented traffic and reject it. `frag_id` is unique per logical
+// message and per sender. `index` is 0-based; `total` is the number of
+// fragments composing the logical message (>= 1). When `total == 1` the
+// payload is the entire serialized frame.
+
+const FRAG_MAGIC: u32 = 0x4B41_4446; // "KADF"
+const FRAG_HEADER_LEN: usize = 4 + 4 + 2 + 2; // 12 bytes
+/// Maximum payload bytes per UDP datagram (after our header).
+/// 1400 leaves headroom for IP (20) + UDP (8) + VLAN tag (4) + tunnel overhead.
+const FRAG_CHUNK_SIZE: usize = 1400;
+/// Reassembly buffers older than this are discarded.
+const REASSEMBLY_TTL: Duration = Duration::from_secs(10);
+/// Hard cap on a logical message size to bound memory usage per peer.
+const MAX_MESSAGE_SIZE: usize = 256 * 1024;
+
+/// Reassembly state for a single in-flight logical message.
+struct ReassemblyEntry {
+    total: u16,
+    received: u16,
+    chunks: Vec<Option<Vec<u8>>>,
+    created_at: Instant,
+}
+
+impl ReassemblyEntry {
+    fn new(total: u16) -> Self {
+        Self {
+            total,
+            received: 0,
+            chunks: (0..total as usize).map(|_| None).collect(),
+            created_at: Instant::now(),
+        }
+    }
+
+    fn insert(&mut self, index: u16, payload: Vec<u8>) -> bool {
+        let idx = index as usize;
+        if idx >= self.chunks.len() {
+            return false;
+        }
+        if self.chunks[idx].is_none() {
+            self.chunks[idx] = Some(payload);
+            self.received += 1;
+        }
+        self.received == self.total
+    }
+
+    fn assemble(self) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        for c in self.chunks {
+            out.extend_from_slice(&c?);
+        }
+        Some(out)
+    }
+}
+
+/// Reassembly buffers keyed by (peer, frag_id).
+type ReassemblyMap = Arc<Mutex<HashMap<(SocketAddr, u32), ReassemblyEntry>>>;
+
+/// Encode a complete serialized message into one or more fragment datagrams.
+fn encode_fragments(frag_id: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+    if payload.is_empty() {
+        // Send an empty single-fragment datagram so the peer still observes
+        // the message; in practice this branch is unreachable for our RPCs.
+        let mut buf = Vec::with_capacity(FRAG_HEADER_LEN);
+        buf.extend_from_slice(&FRAG_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&frag_id.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        return vec![buf];
+    }
+
+    let total = ((payload.len() + FRAG_CHUNK_SIZE - 1) / FRAG_CHUNK_SIZE) as u16;
+    let mut datagrams = Vec::with_capacity(total as usize);
+
+    for (i, chunk) in payload.chunks(FRAG_CHUNK_SIZE).enumerate() {
+        let mut buf = Vec::with_capacity(FRAG_HEADER_LEN + chunk.len());
+        buf.extend_from_slice(&FRAG_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&frag_id.to_be_bytes());
+        buf.extend_from_slice(&(i as u16).to_be_bytes());
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.extend_from_slice(chunk);
+        datagrams.push(buf);
+    }
+    datagrams
+}
+
+/// Parsed fragment header.
+struct FragHeader {
+    frag_id: u32,
+    index: u16,
+    total: u16,
+}
+
+/// Parse a fragment header. Returns `None` if the datagram is malformed or
+/// does not carry our magic.
+fn parse_fragment(data: &[u8]) -> Option<(FragHeader, &[u8])> {
+    if data.len() < FRAG_HEADER_LEN {
+        return None;
+    }
+    let magic = u32::from_be_bytes(data[0..4].try_into().ok()?);
+    if magic != FRAG_MAGIC {
+        return None;
+    }
+    let frag_id = u32::from_be_bytes(data[4..8].try_into().ok()?);
+    let index = u16::from_be_bytes(data[8..10].try_into().ok()?);
+    let total = u16::from_be_bytes(data[10..12].try_into().ok()?);
+    if total == 0 || index >= total {
+        return None;
+    }
+    Some((FragHeader { frag_id, index, total }, &data[FRAG_HEADER_LEN..]))
+}
 
 /// Messages sent over the wire. Each variant corresponds to a Kademlia RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +261,8 @@ pub struct KademliaProtocol {
     pub signature_handler: Arc<dyn SignatureVerifierHandler>,
     pending: PendingMap,
     next_msg_id: Arc<Mutex<u32>>,
+    next_frag_id: Arc<Mutex<u32>>,
+    reassembly: ReassemblyMap,
 }
 
 impl KademliaProtocol {
@@ -152,6 +282,8 @@ impl KademliaProtocol {
             signature_handler,
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_msg_id: Arc::new(Mutex::new(0)),
+            next_frag_id: Arc::new(Mutex::new(0)),
+            reassembly: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -162,22 +294,61 @@ impl KademliaProtocol {
         out
     }
 
-    /// Send a frame to `addr`.
+    async fn next_frag_id(&self) -> u32 {
+        let mut id = self.next_frag_id.lock().await;
+        let out = *id;
+        *id = id.wrapping_add(1);
+        out
+    }
+
+    /// Drop reassembly buffers older than `REASSEMBLY_TTL`. Called opportunistically
+    /// to bound memory usage in the face of lost fragments.
+    async fn gc_reassembly(&self) {
+        let now = Instant::now();
+        let mut map = self.reassembly.lock().await;
+        map.retain(|_, entry| now.duration_since(entry.created_at) < REASSEMBLY_TTL);
+    }
+
+    /// Serialize, fragment, and send a frame to `addr`. Returns false if any
+    /// fragment fails to be transmitted.
     async fn send_frame(&self, addr: SocketAddr, frame: &Frame) -> bool {
-        match bincode::serialize(frame) {
-            Ok(bytes) => {
-                if let Err(e) = self.socket.send_to(&bytes, addr).await {
-                    log::warn!("UDP send to {} failed: {}", addr, e);
-                    false
-                } else {
-                    true
-                }
-            }
+        let bytes = match bincode::serialize(frame) {
+            Ok(b) => b,
             Err(e) => {
                 log::error!("Serialization error: {}", e);
-                false
+                return false;
+            }
+        };
+
+        if bytes.len() > MAX_MESSAGE_SIZE {
+            log::error!(
+                "Refusing to send {} byte message (limit {})",
+                bytes.len(),
+                MAX_MESSAGE_SIZE
+            );
+            return false;
+        }
+
+        let frag_id = self.next_frag_id().await;
+        let datagrams = encode_fragments(frag_id, &bytes);
+
+        if datagrams.len() > 1 {
+            log::debug!(
+                "Sending {} byte frame to {} as {} fragments (frag_id={})",
+                bytes.len(),
+                addr,
+                datagrams.len(),
+                frag_id
+            );
+        }
+
+        for dg in &datagrams {
+            if let Err(e) = self.socket.send_to(dg, addr).await {
+                log::warn!("UDP send to {} failed: {}", addr, e);
+                return false;
             }
         }
+        true
     }
 
     /// Send an RPC request to `addr` and wait for the matching response.
@@ -208,10 +379,80 @@ impl KademliaProtocol {
     }
 
     /// Parse and dispatch an incoming UDP datagram.
+    /// Datagrams are reassembled from fragments before being deserialized.
     /// Responses are routed to waiting `call()` callers via the pending map.
     /// Requests are handled inline and a response is sent back.
     pub async fn handle_datagram(self: &Arc<Self>, data: Vec<u8>, peer: SocketAddr) {
-        let frame: Frame = match bincode::deserialize(&data) {
+        // Step 1: parse fragment header.
+        let (header, chunk) = match parse_fragment(&data) {
+            Some(parts) => parts,
+            None => {
+                log::warn!("Discarded datagram from {} without valid fragment header", peer);
+                return;
+            }
+        };
+
+        // Step 2: reassemble. Single-fragment messages are handled without
+        // touching the reassembly map for the common case.
+        let payload: Vec<u8> = if header.total == 1 {
+            chunk.to_vec()
+        } else {
+            // Bound memory usage upfront: refuse fragments that would push the
+            // logical message over the size limit.
+            let projected = (header.total as usize).saturating_mul(FRAG_CHUNK_SIZE);
+            if projected > MAX_MESSAGE_SIZE {
+                log::warn!(
+                    "Discarded oversized fragmented message from {} ({} fragments)",
+                    peer,
+                    header.total
+                );
+                return;
+            }
+
+            let key = (peer, header.frag_id);
+            let mut map = self.reassembly.lock().await;
+
+            // Insert/get entry, validate consistency, and record the chunk in
+            // a scope that releases the &mut borrow before we call remove().
+            let complete = {
+                let entry = map
+                    .entry(key)
+                    .or_insert_with(|| ReassemblyEntry::new(header.total));
+
+                if entry.total != header.total {
+                    log::warn!(
+                        "Inconsistent total for frag_id={} from {} (got {}, expected {})",
+                        header.frag_id,
+                        peer,
+                        header.total,
+                        entry.total
+                    );
+                    return;
+                }
+                entry.insert(header.index, chunk.to_vec())
+            };
+
+            if !complete {
+                drop(map);
+                // Opportunistic GC of stale buffers.
+                self.gc_reassembly().await;
+                return;
+            }
+
+            // All fragments received: take ownership and assemble.
+            let entry = map.remove(&key).expect("entry checked above");
+            drop(map);
+            match entry.assemble() {
+                Some(p) => p,
+                None => {
+                    log::warn!("Assembly failed for frag_id={} from {}", header.frag_id, peer);
+                    return;
+                }
+            }
+        };
+
+        // Step 3: deserialize and dispatch.
+        let frame: Frame = match bincode::deserialize(&payload) {
             Ok(f) => f,
             Err(e) => {
                 log::warn!("Failed to deserialize: {}", e);
@@ -227,7 +468,7 @@ impl KademliaProtocol {
                     p.welcome_if_new(source).await;
                 });
             }
-            
+
             if let Some(tx) = self.pending.lock().await.remove(&frame.msg_id) {
                 let _ = tx.send(frame.message);
             }

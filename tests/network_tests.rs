@@ -205,7 +205,7 @@ async fn test_delete_did_record() {
     let node2 = start_node(15741).await;
 
     node2.bootstrap(vec![("127.0.0.1".to_string(), 15740)]).await;
-    sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(500)).await;
 
     // Store a record.
     let (pk, sk) = dilithium2::keypair();
@@ -234,7 +234,7 @@ async fn test_delete_did_record() {
     );
 
     // After deletion, get should return None.
-    sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(500)).await;
     let after = node1.get(&key).await;
     assert!(
         after.is_none(),

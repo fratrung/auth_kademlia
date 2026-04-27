@@ -13,4 +13,5 @@ Cargo.lock
 *.swp
 *.swo
 .env/
+
 issuer.bin
