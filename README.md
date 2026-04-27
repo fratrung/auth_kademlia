@@ -42,6 +42,39 @@ Signature validation is handled automatically by the integrated verifier at inse
 
 -----
 
+## Network Layer & Application-Level Fragmentation
+
+Since Post-Quantum Cryptography (PQC) records—containing Dilithium signatures and Kyber keys—often exceed the standard UDP MTU, **AuthKademlia-RS** implements a custom application-level fragmentation and reassembly system.
+
+This ensures that messages remain within safe network limits, avoiding unreliable IP-level fragmentation and improving delivery rates across different network topologies.
+
+### The Message Pipeline
+
+When a node publishes or retrieves a record, the data passes through a structured lifecycle:
+
+1.  **Serialize**: The record is serialized using `bincode` for high-performance binary encoding.
+2.  **Split**: The payload is divided into **5 chunks**, each prefixed with a specialized **`KADF`** header.
+3.  **Send**: The 5 fragments are transmitted independently from sender to receiver.
+4.  **Recv**: The receiver populates a `ReassemblyMap`; internal "slots" for the message light up as fragments arrive.
+5.  **Assemble**: Once all fragments are received, they are concatenated in the correct order.
+6.  **Dispatch**: The reassembled message triggers `rpc_store()`, followed by cryptographic signature verification.
+7.  **Response**: A `StoreResult` is sent back to the sender to acknowledge the completed operation.
+
+### Wire Format & Deep Inspection
+
+Each fragment on the wire follows a strict binary layout, allowing for granular monitoring and debugging:
+
+**Fragment Structure (`KADF`):**
+`[Header: 4B (KADF)] | [Fragment ID: 16B] | [Index: 1B] | [Total: 1B] | [Payload: Var]`
+
+By inspecting fragments in the queue, you can analyze the internal composition of the PQC record:
+* **Dilithium-2 Signature**: Typically spans the first 2-3 chunks due to the size of post-quantum signatures.
+* **Kyber Keys & DID Document**: Contained within the remaining chunks.
+
+This system provides real-time visibility into the network state, where the `ReassemblyMap` visually tracks the progress of every incoming high-capacity RPC call.
+
+-----
+
 ## DID:IIoT Integration
 
 This implementation is designed to interoperate with the [`did:iiot` method](https://github.com/fratrung/did-iiot), an open DID method targeting **Industrial IoT** environments.
