@@ -1,43 +1,38 @@
+/// DHT node binary — used as the entry point for every Docker container.
+///
+/// Environment variables
+/// ─────────────────────
+/// NODE_PORT       UDP port to listen on (default: 5678)
+/// IS_SEED         if set, skip bootstrap and act as permanent seed
+/// BOOTSTRAP_ADDR  <ip>:<port> of the seed to bootstrap from
+/// ROLE            "publisher" (default) | "retriever"
+///                   publisher  → generate + publish a DID Document then keep running
+///                   retriever  → wait, then fetch a key from the DHT and print it
+/// FIXED_DID_UUID  if set, use this string as the DID UUID so the key is deterministic
+///                 (pass the same value to the retriever via RETRIEVE_KEY)
+/// RETRIEVE_KEY    DHT key to look up (required when ROLE=retriever)
+/// RUST_LOG        log filter, e.g. "info", "debug", "auth_kademlia_rs=trace"
 
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use auth_kademlia_rs::auth_handler::DIDSignatureVerifierHandler;
 use auth_kademlia_rs::network::Server;
 
-
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use pqcrypto_dilithium::dilithium2;
 use pqcrypto_kyber::kyber512;
-use pqcrypto_traits::sign::{PublicKey, DetachedSignature};
-use pqcrypto_traits::kem::{PublicKey as KemPublicKey};
-
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use pqcrypto_traits::kem::PublicKey as KemPublicKey;
+use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 use serde_json::{json, Value};
 use uuid::Uuid;
+
+// ─── helpers ────────────────────────────────────────────────────────────────
 
 fn base64url_encode(pk: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(pk)
 }
 
-/// Serialize a DID Document to canonical JSON bytes (sorted keys, no spaces).
-fn encode_did_document(doc: &Value) -> Vec<u8> {
-    let canonical = sort_json_keys(doc);
-    serde_json::to_vec(&canonical).expect("DID Document serialization failed")
-}
-
-fn decode_signed_record(record: Vec<u8>) -> Option<(String, Vec<u8>)> {
-    if record.len() <= 12 { return None; }
-    
-    let sig_len = 2420; // Dilithium2 Signature length
-    if record.len() < 12 + sig_len { return None; }
-    
-    let json_bytes = &record[12 + sig_len..];
-    let doc: Value = serde_json::from_slice(json_bytes).ok()?;
-    
-    Some((serde_json::to_string_pretty(&doc).unwrap(), json_bytes.to_vec()))
-}
-
-/// Recursively sort all object keys so serialization is deterministic.
 fn sort_json_keys(v: &Value) -> Value {
     match v {
         Value::Object(map) => {
@@ -54,11 +49,11 @@ fn sort_json_keys(v: &Value) -> Value {
     }
 }
 
-/// Build the signed record:
-///
-/// ```text
-/// | algorithm (12 bytes, null-padded) | Dilithium signature | DID Document (JSON) |
-/// ```
+fn encode_did_document(doc: &Value) -> Vec<u8> {
+    serde_json::to_vec(&sort_json_keys(doc)).expect("DID Document serialization failed")
+}
+
+/// Wire format: [algorithm: 12 B][Dilithium-2 signature][DID Document JSON]
 fn build_signed_record(
     doc: &Value,
     secret_key: &dilithium2::SecretKey,
@@ -66,24 +61,18 @@ fn build_signed_record(
 ) -> Vec<u8> {
     let doc_bytes = encode_did_document(doc);
 
-    // Pack algorithm into exactly 12 bytes (UTF-8, null-padded on the right).
     let mut alg_field = [0u8; 12];
-    let alg_bytes = algorithm.as_bytes();
-    let copy_len = alg_bytes.len().min(12);
-    alg_field[..copy_len].copy_from_slice(&alg_bytes[..copy_len]);
+    let copy_len = algorithm.len().min(12);
+    alg_field[..copy_len].copy_from_slice(&algorithm.as_bytes()[..copy_len]);
 
-    let detached_sig = dilithium2::detached_sign(&doc_bytes, secret_key);
-    let signature = detached_sig.as_bytes();
+    let sig = dilithium2::detached_sign(&doc_bytes, secret_key);
+    let sig_bytes = sig.as_bytes();
 
-    let mut record = Vec::with_capacity(12 + signature.len() + doc_bytes.len());
+    let mut record = Vec::with_capacity(12 + sig_bytes.len() + doc_bytes.len());
     record.extend_from_slice(&alg_field);
-    record.extend_from_slice(signature);
+    record.extend_from_slice(sig_bytes);
     record.extend_from_slice(&doc_bytes);
     record
-}
-
-fn generate_did_iiot() -> String {
-    format!("did:iiot:{}", Uuid::new_v4())
 }
 
 fn build_did_document(
@@ -91,9 +80,6 @@ fn build_did_document(
     dilithium_pk: &dilithium2::PublicKey,
     kyber_pk: &kyber512::PublicKey,
 ) -> Value {
-    let dilithium_x = base64url_encode(dilithium_pk.as_bytes());
-    let kyber_x = base64url_encode(kyber_pk.as_bytes());
-
     json!({
         "@context": ["https://www.w3.org/ns/did/v1"],
         "id": did,
@@ -102,118 +88,254 @@ fn build_did_document(
                 "id": format!("{}#k0", did),
                 "type": "JsonWebKey2020",
                 "controller": did,
-                "publicKeyJwk": {
-                    "kty": "OKP",
-                    "crv": "Dilithium2",
-                    "x": dilithium_x
-                }
+                "publicKeyJwk": { "kty": "OKP", "crv": "Dilithium2",
+                                  "x": base64url_encode(dilithium_pk.as_bytes()) }
             },
             {
                 "id": format!("{}#k1", did),
                 "type": "JsonWebKey2020",
                 "controller": did,
-                "publicKeyJwk": {
-                    "kty": "OKP",
-                    "crv": "Kyber512",
-                    "x": kyber_x
-                }
+                "publicKeyJwk": { "kty": "OKP", "crv": "Kyber512",
+                                  "x": base64url_encode(kyber_pk.as_bytes()) }
             }
         ],
         "authentication": [ format!("{}#k0", did) ],
         "keyAgreement":   [ format!("{}#k1", did) ],
-        "service": [
-            {
-                "id": format!("{}#device", did),
-                "type": "DeviceAgent",
-                "serviceEndpoint": "http://example.com/device"
-            }
-        ]
+        "service": [{
+            "id":              format!("{}#device", did),
+            "type":            "DeviceAgent",
+            "serviceEndpoint": "http://example.com/device"
+        }]
     })
 }
 
+/// Decode a signed record and return the pretty-printed DID Document JSON.
+fn decode_record(record: &[u8]) -> Option<String> {
+    // layout: [12 B alg][2420 B Dilithium-2 sig][JSON…]
+    const SIG_LEN: usize = 2420;
+    if record.len() < 12 + SIG_LEN {
+        return None;
+    }
+    let alg_raw = &record[..12];
+    let alg = std::str::from_utf8(alg_raw)
+        .unwrap_or("?")
+        .trim_end_matches('\0');
+    let json_bytes = &record[12 + SIG_LEN..];
+    let doc: Value = serde_json::from_slice(json_bytes).ok()?;
+    log::debug!("Record algorithm field: {:?}", alg);
+    serde_json::to_string_pretty(&doc).ok()
+}
 
-async fn start_node(port: u16) -> Server {
+// ─── node factory ───────────────────────────────────────────────────────────
+
+async fn start_server(port: u16) -> Server {
     let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
     let mut server = Server::new(handler, 20, 3, None, None);
-    server.listen(port, "0.0.0.0").await.unwrap();
-    println!(">>> Node started on port {}", port);
+    server.listen(port, "0.0.0.0").await.expect("Failed to bind UDP socket");
+    log::info!("Node listening on 0.0.0.0:{}", port);
     server
 }
 
+/// Bootstrap with retries. Returns true when at least one peer is discovered.
+async fn bootstrap_with_retries(server: &Server, ip: &str, port: u16) -> bool {
+    let max_retries = 8;
+    for attempt in 1..=max_retries {
+        log::info!(
+            "Bootstrap attempt {}/{} → {}:{}",
+            attempt, max_retries, ip, port
+        );
+        let discovered = server.bootstrap(vec![(ip.to_string(), port)]).await;
+        if !discovered.is_empty() {
+            log::info!(
+                "Bootstrap successful — discovered {} peer(s)",
+                discovered.len()
+            );
+            return true;
+        }
+        log::warn!(
+            "Bootstrap attempt {} returned no peers, retrying in 3 s…",
+            attempt
+        );
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    }
+    log::error!("Bootstrap failed after {} attempts", max_retries);
+    false
+}
+
+// ─── publisher ──────────────────────────────────────────────────────────────
+
+async fn run_publisher(server: &Server) {
+    let uuid = std::env::var("FIXED_DID_UUID")
+        .unwrap_or_else(|_| Uuid::new_v4().to_string());
+    let did = format!("did:iiot:{}", uuid);
+    let dht_key = uuid.clone();
+
+    log::info!("Publisher: DID  = {}", did);
+    log::info!("Publisher: key  = {}", dht_key);
+
+    let (dpk, dsk) = dilithium2::keypair();
+    let (kpk, _) = kyber512::keypair();
+    log::debug!("Publisher: keypairs generated");
+
+    let doc = build_did_document(&did, &dpk, &kpk);
+    let record = build_signed_record(&doc, &dsk, "Dilithium-2");
+
+    log::info!(
+        "Publisher: signed record size = {} B ({} fragments over UDP)",
+        record.len(),
+        (record.len() + 1399) / 1400,
+    );
+
+    let max_attempts = 10;
+    for attempt in 1..=max_attempts {
+        log::info!("Publisher: set attempt {}/{}", attempt, max_attempts);
+        match server.set(&dht_key, record.clone()).await {
+            Some(true) => {
+                log::info!(
+                    "Publisher: DID Document published successfully (key={})",
+                    dht_key
+                );
+
+                // Immediate local round-trip to confirm.
+                match server.get(&dht_key).await {
+                    Some(retrieved) => {
+                        log::info!("Publisher: local get OK ({} B)", retrieved.len());
+                        if let Some(pretty) = decode_record(&retrieved) {
+                            log::debug!("Publisher: DID Document content:\n{}", pretty);
+                        }
+                    }
+                    None => log::warn!(
+                        "Publisher: local get returned None right after publish"
+                    ),
+                }
+                return;
+            }
+            Some(false) => {
+                log::warn!("Publisher: set returned false on attempt {}", attempt);
+            }
+            None => {
+                log::warn!(
+                    "Publisher: set returned None on attempt {} \
+                     (key may already exist or signature rejected)",
+                    attempt
+                );
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    }
+    log::error!(
+        "Publisher: all {} attempts failed — node keeps running",
+        max_attempts
+    );
+}
+
+// ─── retriever ──────────────────────────────────────────────────────────────
+
+async fn run_retriever(server: &Server) {
+    let key = match std::env::var("RETRIEVE_KEY") {
+        Ok(k) => k,
+        Err(_) => {
+            log::error!("Retriever: RETRIEVE_KEY env var is not set — nothing to retrieve");
+            return;
+        }
+    };
+
+    log::info!("Retriever: will look up key={}", key);
+    log::info!("Retriever: waiting 5 s for publisher to propagate…");
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    let max_attempts = 10;
+    for attempt in 1..=max_attempts {
+        log::info!(
+            "Retriever: get attempt {}/{} for key={}",
+            attempt, max_attempts, key
+        );
+        match server.get(&key).await {
+            Some(record) => {
+                log::info!(
+                    "Retriever: record found! ({} B, key={})",
+                    record.len(), key
+                );
+                match decode_record(&record) {
+                    Some(pretty) => {
+                        log::info!("Retriever: DID Document:\n{}", pretty);
+                    }
+                    None => log::warn!("Retriever: could not decode record structure"),
+                }
+                return;
+            }
+            None => {
+                log::warn!(
+                    "Retriever: key={} not found on attempt {}/{}",
+                    key, attempt, max_attempts
+                );
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    }
+    log::error!(
+        "Retriever: key={} not found after {} attempts",
+        key, max_attempts
+    );
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    
-    let port: u16 = std::env::var("NODE_PORT").unwrap_or_else(|_| "5678".to_string()).parse()?;
-    let mut server = start_node(port).await;
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    let port: u16 = std::env::var("NODE_PORT")
+        .unwrap_or_else(|_| "5678".to_string())
+        .parse()?;
+
+    let role = std::env::var("ROLE").unwrap_or_else(|_| "publisher".to_string());
+
+    log::info!(
+        "=== DHT node starting | port={} role={} ===",
+        port, role
+    );
+
+    let mut server = start_server(port).await;
+
+    // ── seed ─────────────────────────────────────────────────────────────────
     if std::env::var("IS_SEED").is_ok() {
-        println!(">>> Running as Seed Node. Ready.");
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        log::info!("Running as SEED node — no bootstrap required");
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    } else if let Ok(bootstrap_addr) = std::env::var("BOOTSTRAP_ADDR") {
-        let parts: Vec<&str> = bootstrap_addr.split(':').collect();
-        let ip = parts[0].to_string();
-        let port: u16 = parts[1].parse()?;
-        
-        println!(">>> Bootstrapping to {}:{}...", ip, port);
-        let mut retries = 0;
-        while retries < 5 {
-            let discovered = server.bootstrap(vec![(ip.clone(), port)]).await;
-            if !discovered.is_empty() {
-                println!(">>> Bootstrap success! Discovered {} nodes.", discovered.len());
-                break;
-            }
-            println!(">>> Bootstrap empty, retrying...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            retries += 1;
+    // ── peer ─────────────────────────────────────────────────────────────────
+    } else if let Ok(addr) = std::env::var("BOOTSTRAP_ADDR") {
+        let parts: Vec<&str> = addr.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            log::error!("BOOTSTRAP_ADDR must be <ip>:<port>, got: {}", addr);
+            return Err("bad BOOTSTRAP_ADDR".into());
         }
+        let bip = parts[0];
+        let bport: u16 = parts[1].parse().map_err(|_| "bad port in BOOTSTRAP_ADDR")?;
+
+        log::info!("Peer node — bootstrapping to {}:{}", bip, bport);
+        // Brief wait so the seed container finishes binding.
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        let ok = bootstrap_with_retries(&server, bip, bport).await;
+        if !ok {
+            log::warn!("Bootstrap did not discover any peers; continuing anyway");
+        }
+    } else {
+        log::warn!("Neither IS_SEED nor BOOTSTRAP_ADDR is set — running as isolated node");
     }
 
-    println!(">>> Starting publication process...");
-    
-    let (dilithium_pk, dilithium_sk) = dilithium2::keypair();
-    let (kyber_pk, _) = kyber512::keypair();
-    let did = generate_did_iiot();
-    let dht_key = did.split(':').last().unwrap().to_string();
-    let signed_record = build_signed_record(&build_did_document(&did, &dilithium_pk, &kyber_pk), &dilithium_sk, "Dilithium-2");
-
-    let mut attempt = 0;
-    while attempt < 10 {
-        match server.set(&dht_key, signed_record.clone()).await {
-            Some(true) => {
-                println!(">>> SUCCESS: DID Document published!");
-                break;
-            }
-            _ => {
-                println!(">>> Attempt {}/10 failed, retrying...", attempt + 1);
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                attempt += 1;
-            }
-        }
+    // ── role dispatch ─────────────────────────────────────────────────────────
+    match role.as_str() {
+        "retriever" => run_retriever(&server).await,
+        _ => run_publisher(&server).await,
     }
 
-    println!(">>> Testing retrieval for key: {}", dht_key);
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-    match server.get(&dht_key).await {
-        Some(record) => {
-            println!(">>> SUCCESS: Record found in DHT!");
-            if let Some((json_str, _)) = decode_signed_record(record) {
-                println!(">>> Decoded DID Document:\n{}", json_str);
-            } else {
-                println!(">>> ERROR: Could not decode record structure.");
-            }
-        }
-        None => println!(">>> ERROR: Record not found in DHT."),
-    }
-
-    println!(">>> Node active and listening for DHT requests.");
-
+    log::info!("Node active — waiting for Ctrl-C");
     tokio::signal::ctrl_c().await?;
-    
-    println!("\n>>> Shutdown signal received. Cleaning up...");
-    server.stop().await;
 
-    println!(">>> Node stopped gracefully.");
+    log::info!("Shutdown signal received — cleaning up…");
+    server.stop().await;
+    log::info!("Node stopped gracefully");
     Ok(())
 }

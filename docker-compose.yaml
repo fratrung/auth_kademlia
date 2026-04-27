@@ -1,3 +1,7 @@
+# DEMO_DID_UUID is read from the .env file in the same directory.
+# peer1 publishes under that key; peer2 retrieves it.
+# To change the demo DID, edit .env and restart with `docker compose up --build`.
+
 services:
   seed:
     build: .
@@ -5,6 +9,7 @@ services:
     environment:
       - NODE_PORT=5678
       - IS_SEED=true
+      - RUST_LOG=info
     networks:
       dht_net:
         ipv4_address: 172.20.0.10
@@ -16,10 +21,15 @@ services:
     container_name: dht_peer_1
     environment:
       - NODE_PORT=5679
-      - BOOTSTRAP_ADDR=172.20.0.10:5678 
+      - BOOTSTRAP_ADDR=172.20.0.10:5678
+      - ROLE=publisher
+      - FIXED_DID_UUID=${DEMO_DID_UUID}
+      - RUST_LOG=info
     networks:
       dht_net:
         ipv4_address: 172.20.0.11
+    depends_on:
+      - seed
 
   peer2:
     build: .
@@ -27,9 +37,14 @@ services:
     environment:
       - NODE_PORT=5680
       - BOOTSTRAP_ADDR=172.20.0.10:5678
+      - ROLE=retriever
+      - RETRIEVE_KEY=${DEMO_DID_UUID}
+      - RUST_LOG=info
     networks:
       dht_net:
         ipv4_address: 172.20.0.12
+    depends_on:
+      - seed
 
   peer3:
     build: .
@@ -37,10 +52,14 @@ services:
     environment:
       - NODE_PORT=5681
       - BOOTSTRAP_ADDR=172.20.0.10:5678
+      - ROLE=publisher
+      - RUST_LOG=info
     networks:
       dht_net:
         ipv4_address: 172.20.0.13
-        
+    depends_on:
+      - seed
+
 networks:
   dht_net:
     driver: bridge

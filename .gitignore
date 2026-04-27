@@ -12,6 +12,7 @@ Cargo.lock
 .vscode/
 *.swp
 *.swo
+.env
 .env/
 
 issuer.bin

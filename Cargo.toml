@@ -57,6 +57,7 @@ thiserror      = "1"
 
 # Logging
 log            = "0.4"
+env_logger     = "0.11"
 
 # Python binding (optional — only compiled with --features python)
 # Use maturin for building the extension: `maturin build --features python`
