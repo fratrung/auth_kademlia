@@ -294,3 +294,62 @@ async fn test_bootstrap_unreachable_peer_returns_empty() {
         "bootstrap against an unreachable peer must return an empty list"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Update rejected when new record has invalid self-signature (port 15780)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `update` must return None when the submitted new record has a valid
+/// auth_signature (proving ownership of the old key) but an invalid
+/// self-signature (the embedded public key does not match the signing key).
+///
+/// This exercises the rpc_update path on a live two-node setup.
+#[tokio::test]
+async fn test_update_rejected_when_new_record_self_sig_invalid() {
+    let mut node1 = start_node(15780).await;
+    let node2 = start_node(15781).await;
+
+    node2.bootstrap(vec![("127.0.0.1".to_string(), 15780)]).await;
+    sleep(Duration::from_millis(200)).await;
+
+    // Store a valid original record on node1.
+    let (old_pk, old_sk) = dilithium2::keypair();
+    let (kpk, _) = kyber512::keypair();
+    let did = generate_did_iiot();
+    let key = did.split(':').last().unwrap().to_string();
+    let old_doc = build_did_document(&did, &old_pk, &kpk);
+    let old_record = build_signed_record(&old_doc, &old_sk, "Dilithium-2");
+
+    let stored = node1.set(&key, old_record.clone()).await;
+    assert!(stored.unwrap_or(false), "initial store must succeed");
+
+    // Build a new record where the DID Document embeds new_pk but the
+    // record is signed with wrong_new_sk — self-signature is invalid.
+    let (new_pk, _) = dilithium2::keypair();
+    let (_, wrong_new_sk) = dilithium2::keypair();
+    let (new_kpk, _) = kyber512::keypair();
+    let new_doc = build_did_document(&did, &new_pk, &new_kpk);
+    let invalid_new_record = build_signed_record(&new_doc, &wrong_new_sk, "Dilithium-2");
+
+    // auth_sig is correctly signed with the old key — ownership proof is valid,
+    // but the new record's self-signature is invalid.
+    let auth_sig = dilithium2::detached_sign(&invalid_new_record, &old_sk)
+        .as_bytes()
+        .to_vec();
+
+    let result = node2.update(&key, invalid_new_record, Some(auth_sig)).await;
+    assert!(
+        result.is_none(),
+        "update must be rejected when the new record's self-signature is invalid"
+    );
+
+    // Original record must still be retrievable.
+    let still_there = node1.get(&key).await;
+    assert!(
+        still_there.is_some(),
+        "original record must remain after rejected update"
+    );
+    assert_eq!(still_there.unwrap(), old_record);
+
+    node1.stop().await;
+}

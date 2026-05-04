@@ -98,6 +98,56 @@ fn build_record_d2(doc: &Value, sk: &dilithium2::SecretKey) -> Vec<u8> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// JSON canonicalisation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `sort_json_keys` must produce byte-identical output on repeated calls with
+/// equal input — including nested objects and arrays.
+#[test]
+fn test_sort_json_keys_is_deterministic_and_canonical() {
+    let doc = json!({
+        "z_key": "last",
+        "a_key": "first",
+        "nested": {
+            "z_nested": 99,
+            "a_nested": [3, 1, 2],
+            "m_nested": { "b": false, "a": true }
+        },
+        "array": [
+            { "z": 1, "a": 0 },
+            { "y": 2, "b": 1 }
+        ]
+    });
+
+    // Repeated calls must produce identical bytes.
+    let bytes_1 = canonical_json(&doc);
+    let bytes_2 = canonical_json(&doc);
+    assert_eq!(bytes_1, bytes_2, "canonical_json must be deterministic");
+
+    let text = String::from_utf8(bytes_1).unwrap();
+
+    // Top-level keys must be in alphabetical order: a_key < array < nested < z_key.
+    let pos_a_key  = text.find("\"a_key\"").expect("a_key not found");
+    let pos_array  = text.find("\"array\"").expect("array not found");
+    let pos_nested = text.find("\"nested\"").expect("nested not found");
+    let pos_z_key  = text.find("\"z_key\"").expect("z_key not found");
+    assert!(pos_a_key < pos_array,  "a_key must precede array");
+    assert!(pos_array < pos_nested, "array must precede nested");
+    assert!(pos_nested < pos_z_key, "nested must precede z_key");
+
+    // Nested keys in m_nested must also be sorted: a < b.
+    let pos_a_nested = text.find("\"a\":true").expect("\"a\":true not found");
+    let pos_b_nested = text.find("\"b\":false").expect("\"b\":false not found");
+    assert!(pos_a_nested < pos_b_nested, "a must precede b in m_nested");
+
+    // Array element order must be preserved (not sorted): first element has "z",
+    // second has "y".
+    let pos_z_elem = text.find("\"z\":1").expect("\"z\":1 not found");
+    let pos_y_elem = text.find("\"y\":2").expect("\"y\":2 not found");
+    assert!(pos_z_elem < pos_y_elem, "array element order must be preserved");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Algorithm resolution
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -412,6 +462,35 @@ fn test_did_handler_accepts_valid_key_rotation() {
             .handle_update_verification(&new_record, &old_record, &auth_sig)
             .unwrap(),
         "valid key-rotation update must be accepted"
+    );
+}
+
+/// Update where new_record has a valid auth_sig but an invalid self-signature
+/// (the DID Document embeds key A's public key but was signed with key B) is
+/// rejected at step 3 of verify_key_rotation.
+#[test]
+fn test_did_handler_rejects_update_with_invalid_new_record_self_sig() {
+    let (old_pk, old_sk) = dilithium2::keypair();
+    let (new_pk, _) = dilithium2::keypair();
+    let (_, wrong_new_sk) = dilithium2::keypair(); // key mismatch for self-sig
+    let did = format!("did:iiot:{}", Uuid::new_v4());
+
+    let old_doc = build_did_doc_d2(&did, &old_pk);
+    let old_record = build_record_d2(&old_doc, &old_sk);
+
+    // new_record: doc embeds new_pk but is signed with wrong_new_sk → invalid self-sig
+    let new_doc = build_did_doc_d2(&did, &new_pk);
+    let new_record = build_record_d2(&new_doc, &wrong_new_sk);
+
+    // auth_sig is produced correctly with old_sk
+    let auth_sig = dilithium2::detached_sign(&new_record, &old_sk).as_bytes().to_vec();
+
+    let handler = DIDSignatureVerifierHandler::new(PathBuf::from("irrelevant.bin"));
+    assert!(
+        !handler
+            .handle_update_verification(&new_record, &old_record, &auth_sig)
+            .unwrap(),
+        "update must be rejected when the new record's self-signature is invalid"
     );
 }
 

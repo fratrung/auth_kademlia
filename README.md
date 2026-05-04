@@ -53,25 +53,26 @@ This ensures that messages remain within safe network limits, avoiding unreliabl
 When a node publishes or retrieves a record, the data passes through a structured lifecycle:
 
 1.  **Serialize**: The record is serialized using `bincode` for high-performance binary encoding.
-2.  **Split**: The payload is divided into **5 chunks**, each prefixed with a specialized **`KADF`** header.
-3.  **Send**: The 5 fragments are transmitted independently from sender to receiver.
-4.  **Recv**: The receiver populates a `ReassemblyMap`; internal "slots" for the message light up as fragments arrive.
-5.  **Assemble**: Once all fragments are received, they are concatenated in the correct order.
-6.  **Dispatch**: The reassembled message triggers `rpc_store()`, followed by cryptographic signature verification.
-7.  **Response**: A `StoreResult` is sent back to the sender to acknowledge the completed operation.
+2.  **Split**: The payload is split into chunks of up to **1400 bytes** each, every chunk prefixed with a `KADF` header. A typical Dilithium-2 record (~6 KB) produces 5 fragments.
+3.  **Send**: Fragments are transmitted independently from sender to receiver.
+4.  **Recv**: The receiver populates a `ReassemblyMap` keyed by `(peer_addr, frag_id)`; slots fill as fragments arrive.
+5.  **Assemble**: Once all fragments are received, they are concatenated in index order.
+6.  **Dispatch**: The reassembled payload is deserialized and dispatched (e.g. `rpc_store()`), followed by cryptographic signature verification.
+7.  **Response**: A result message is sent back to the sender to acknowledge the operation.
 
-### Wire Format & Deep Inspection
+### Wire Format
 
-Each fragment on the wire follows a strict binary layout, allowing for granular monitoring and debugging:
+Each UDP datagram sent by this layer has the following layout (all multi-byte integers big-endian):
 
-**Fragment Structure (`KADF`):**
-`[Header: 4B (KADF)] | [Fragment ID: 16B] | [Index: 1B] | [Total: 1B] | [Payload: Var]`
+```
+[magic: 4 B "KADF"][frag_id: 4 B u32][index: 2 B u16][total: 2 B u16][payload: variable]
+```
 
-By inspecting fragments in the queue, you can analyze the internal composition of the PQC record:
-* **Dilithium-2 Signature**: Typically spans the first 2-3 chunks due to the size of post-quantum signatures.
-* **Kyber Keys & DID Document**: Contained within the remaining chunks.
+Total header: **12 bytes**. `frag_id` is unique per logical message per sender. `index` is 0-based; `total` is the number of fragments (≥ 1). When `total == 1` the datagram carries the entire frame.
 
-This system provides real-time visibility into the network state, where the `ReassemblyMap` visually tracks the progress of every incoming high-capacity RPC call.
+By inspecting fragments you can identify the internal composition of a PQC record:
+* **Dilithium-2 signature** (2420 B): spans roughly the first two fragments.
+* **DID Document JSON** (with base64-encoded Kyber/Dilithium public keys): in the remaining fragments.
 
 -----
 
@@ -106,14 +107,13 @@ authkademlia-rs = { git = "https://github.com/fratrung/auth_kademlia" }
 use std::sync::Arc;
 use std::path::PathBuf;
 
-use auth_kademlia::auth_handler::DIDSignatureVerifierHandler;
-use auth_kademlia::network::Server;
-
+use auth_kademlia_rs::auth_handler::DIDSignatureVerifierHandler;
+use auth_kademlia_rs::network::Server;
 
 use pqcrypto_dilithium::dilithium2;
 use pqcrypto_kyber::kyber512;
 use pqcrypto_traits::sign::{PublicKey, DetachedSignature};
-use pqcrypto_traits::kem::{PublicKey as KemPublicKey};
+use pqcrypto_traits::kem::PublicKey as KemPublicKey;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
@@ -230,98 +230,53 @@ fn build_did_document(
     })
 }
 
-// Helper function to initialize and start a Kademlia node
 async fn start_node(port: u16) -> Server {
-    // Initialize the signature handler with the issuer's public key
     let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
-        
-    // Create a new Server: ksize=20, alpha=3
     let mut server = Server::new(handler, 20, 3, None, None);
-        
-    // Start listening on the specified port
-    server.listen(port, "127.0.0.1").await.unwrap();
-    println!(">>> Node started on port {}", port);
+    server.listen(port, "127.0.0.1").await.expect("failed to bind UDP socket");
     server
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    
-    // Start two local nodes
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let node_1 = start_node(5678).await;
     let node_2 = start_node(5679).await;
 
-    // Node 2 performs bootstrap toward Node 1 to join the network
-    println!(">>> Node 2: Performing bootstrap towards Node 1 (5678)...");
+    // Bootstrap node_2 into the network via node_1.
     let discovered = node_2.bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
-    
-    println!(">>> Node 2 discovered {} nodes during bootstrap", discovered.len());
-    
-    // Fallback logic if initial bootstrap fails
     if discovered.is_empty() {
-        println!(">>> WARNING: Bootstrap failed, forcing manual retry...");
-        node_2.bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
-    }
-    
-    // Allow some time for the DHT routing tables to update
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    node_2.bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
-    
-    sleep(Duration::from_secs(1)).await;
-
-    // --- Post-Quantum Cryptography Section ---
-    // Generate PQC keypairs (Dilithium for signatures, Kyber for encryption)
-    let (dilithium_pk, dilithium_sk) = dilithium2::keypair();
-    let (kyber_pk, _) = kyber512::keypair();
-    
-    // Create a unique Decentralized Identifier (DID)
-    let did = generate_did_iiot();
-    let did_doc = build_did_document(&did, &dilithium_pk, &kyber_pk);
-    
-    // Extract the hash-part of the DID to use as the DHT key
-    let dht_key = did.split(':').last().unwrap().to_string();
-
-    // Sign the DID Document using Dilithium-2
-    let signed_record = build_signed_record(&did_doc, &dilithium_sk, "Dilithium-2");
-    
-    // Retry loop to publish the record (waiting for network stabilization)
-    let mut is_ready = false;
-    for i in 0..10 {
-        let success = node_2.set(&dht_key.clone(), signed_record.clone()).await;
-        
-        if success == Some(true) {
-            println!(">>> Network stabilized and record published on attempt {}!", i + 1);
-            is_ready = true;
-            break;
-        }
-        println!(">>> Attempt {}: Waiting for neighbors in the DHT...", i + 1);
-        sleep(Duration::from_millis(500)).await;
-    }
-
-    if !is_ready {
-        println!(">>> ERROR: Failed to publish the record to the DHT.");
+        eprintln!("Bootstrap returned no peers — is node_1 reachable?");
         return Ok(());
     }
 
-    println!(">>> Node 1: Retrieving record '{}'...", dht_key);
+    // Generate PQC keypairs and build a DID Document.
+    let (dilithium_pk, dilithium_sk) = dilithium2::keypair();
+    let (kyber_pk, _) = kyber512::keypair();
+    let did = generate_did_iiot();
+    let did_doc = build_did_document(&did, &dilithium_pk, &kyber_pk);
+    let dht_key = did.split(':').last().expect("invalid DID format").to_string();
+    let signed_record = build_signed_record(&did_doc, &dilithium_sk, "Dilithium-2");
+
+    // Publish: set() returns None if the key exists or the signature is invalid.
+    match node_2.set(&dht_key, signed_record).await {
+        Some(true) => println!("Record published under key {}", dht_key),
+        _ => {
+            eprintln!("Failed to publish record");
+            return Ok(());
+        }
+    }
+
+    // Retrieve from a different node.
     match node_1.get(&dht_key).await {
         Some(record) => {
-            println!(">>> Node 1: Record found! ({} bytes)", record.len());
-            
-            // Parse the binary record: [Algorithm Name (12 bytes)] [Signature] [DID Document JSON]
-            let alg_cow = String::from_utf8_lossy(&record[0..12]);
-            let alg = alg_cow.trim_matches(char::from(0)); // Remove null padding
             let doc_start = 12 + dilithium2::signature_bytes();
-            let doc_bytes = &record[doc_start..];
-            
-            if let Ok(doc) = serde_json::from_slice::<Value>(doc_bytes) {
-                println!(">>> Analysis:");
-                println!("    - Algorithm: {}", alg);
-                println!("    - DID Document ID: {}", doc["id"]);
-                println!("    - Full JSON: {}", serde_json::to_string_pretty(&doc).unwrap());
+            if let Ok(doc) = serde_json::from_slice::<Value>(&record[doc_start..]) {
+                println!("Retrieved DID: {}", doc["id"]);
             }
-        },
-        None => println!(">>> Node 1: Record not found!"),
+        }
+        None => eprintln!("Record not found"),
     }
 
     Ok(())
@@ -331,13 +286,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Logging
 
-AuthKademlia-RS uses the [`tracing`](https://docs.rs/tracing) ecosystem for structured, level-based logging. To enable debug output:
+AuthKademlia-RS uses the [`log`](https://docs.rs/log) crate with [`env_logger`](https://docs.rs/env_logger) as the backend. To enable debug output in your application:
 
 ```rust
-tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::DEBUG)
-    .init();
+env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 ```
+
+When running tests or the binary directly, use the `RUST_LOG` environment variable:
+
+```bash
+RUST_LOG=debug cargo test -- --nocapture
+RUST_LOG=auth_kademlia_rs=trace cargo run --bin dht_node
+```
+
+-----
+
+## Python Bindings (experimental)
+
+An optional Python extension can be built with [maturin](https://github.com/PyO3/maturin):
+
+```bash
+maturin develop --features python
+```
+
+> **Note:** The `python` feature builds a `cdylib` target via PyO3. Do **not** enable it in Rust-only deployments — the `cdylib` crate type changes linking behaviour and is unnecessary outside of Python extension builds. The Python bindings are experimental and not covered by the same stability guarantees as the Rust API.
 
 -----
 

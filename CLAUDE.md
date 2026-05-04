@@ -11,12 +11,12 @@ private key.
 ```
 cargo build                          # library + dht_node binary
 cargo build --bin dht_node           # only the Docker entry point
-cargo test                           # all 53 tests (no network required)
+cargo test                           # all 126 tests
 cargo test <name>                    # single test, e.g. test_delete_did_record
 RUST_LOG=debug cargo test -- --nocapture   # verbose output
 ```
 
-Python extension (maturin, optional):
+Python extension (maturin, optional — do not use in Rust-only deployments):
 ```
 maturin develop --features python
 ```
@@ -24,16 +24,23 @@ maturin develop --features python
 ## Module map
 | File | Role |
 |---|---|
-| `src/protocol.rs` | UDP transport, fragmentation, RPC dispatch |
-| `src/network.rs` | Public `Server` API: `set/get/update/delete` |
-| `src/crawling.rs` | Iterative lookup (NodeSpider / ValueSpider) |
-| `src/routing.rs` | Kademlia routing table + k-buckets |
-| `src/storage.rs` | `ForgetfulStorage` — TTL-based KV store |
-| `src/auth_handler.rs` | `SignatureVerifierHandler` trait + DID implementation |
-| `src/crypto/` | Dilithium, Kyber, Ed25519, RSA verifiers + `KeyManager` |
-| `src/node.rs` | `Node` struct, XOR distance |
-| `src/utils.rs` | `digest()` (SHA-1 → `[u8; 20]`), `ID_LEN = 20` |
-| `scripts/dht_node.rs` | Docker container entry point |
+| `src/protocol.rs` | UDP transport, fragmentation, RPC dispatch (`rpc_store`, `rpc_update`, `rpc_delete`, `rpc_find_node`, `rpc_find_value`) |
+| `src/network.rs` | Public `Server` API: `set/get/update/delete`, bootstrap, refresh loop |
+| `src/crawling.rs` | Iterative lookup — `NodeSpiderCrawl` (find nodes) + `ValueSpiderCrawl` (find value) |
+| `src/routing.rs` | Kademlia routing table + k-buckets (XOR distance, bucket splits) |
+| `src/storage.rs` | `ForgetfulStorage` — insertion-ordered TTL KV store (`IndexMap`) |
+| `src/fragmentation.rs` | KADF fragmentation + reassembly (`encode_fragments`, `parse_fragment`, `ReassemblyMap`) |
+| `src/auth_handler.rs` | `SignatureVerifierHandler` trait + `DIDSignatureVerifierHandler` (DID record verification) |
+| `src/crypto/signature_verifier.rs` | `SignatureVerifier` trait, `resolve_alg_and_length()`, algorithm registry |
+| `src/crypto/factory.rs` | `SignatureVerifierFactory` + `SignerFactory` — dispatch by algorithm string |
+| `src/crypto/dilithium.rs` | Dilithium-2/3/5 verifier + signer |
+| `src/crypto/ed25519.rs` | Ed25519 verifier + signer |
+| `src/crypto/rsa.rs` | RSA verifier + signer |
+| `src/crypto/key_manager.rs` | `KeyManager` — keypair generation, storage, sign/verify helpers |
+| `src/node.rs` | `Node` struct, XOR distance, `from_id` |
+| `src/utils.rs` | `digest()` (SHA-1 → `[u8; 20]`), `digest_bytes()`, `ID_LEN = 20` |
+| `scripts/dht_node.rs` | Docker container entry point (`publisher` / `retriever` roles) |
+| `tests/common/mod.rs` | Shared test helpers: `start_node`, `build_did_document`, `build_signed_record`, `generate_did_iiot` |
 
 ## Wire record format
 ```
@@ -43,26 +50,61 @@ maturin develop --features python
 ```
 The algorithm field drives `resolve_alg_and_length()` in
 `src/crypto/signature_verifier.rs` to pick the right verifier and signature
-length. Supported: `Dilithium-2/3/5`, `Ed25519`, `RSA`.
+length. Supported: `Dilithium-2/3/5` (2420/3293/4595 B), `Ed25519` (64 B), `RSA` (256 B).
 
-## Application-level fragmentation (`protocol.rs`)
+## Application-level fragmentation (`src/fragmentation.rs`)
 Large PQ records (~6 KB) are split into 1400-byte chunks before sending.
-Wire format per UDP datagram:
+Wire format per UDP datagram (all integers big-endian):
 ```
-[magic: 4 B "KADF"][frag_id: u32 BE][index: u16 BE][total: u16 BE][payload]
+[magic: 4 B "KADF"][frag_id: u32 4 B][index: u16 2 B][total: u16 2 B][payload]
 ```
+Total header: **12 bytes**. `frag_id` is unique per logical message per sender.
+`index` is 0-based; `total` is the number of fragments (≥ 1).
 Constants: `FRAG_CHUNK_SIZE=1400`, `FRAG_HEADER_LEN=12`,
 `MAX_MESSAGE_SIZE=256 KB`, `REASSEMBLY_TTL=10 s`.
-`handle_datagram()` reassembles transparently before deserialising.
+`handle_datagram()` in `protocol.rs` reassembles transparently before deserialising.
+Oversized messages (projected size > `MAX_MESSAGE_SIZE`) are discarded before
+entering the reassembly buffer to bound memory usage.
+
+## RPC message types (`src/protocol.rs`)
+| Variant | Direction | Purpose |
+|---|---|---|
+| `Ping` / `Pong` | req/resp | Liveness check + node discovery |
+| `Store` / `StoreResult` | req/resp | Store a new authenticated record |
+| `Update` / `UpdateResult` | req/resp | Key-rotation update (requires `auth_signature`) |
+| `UpdateStatusList` / `UpdateStatusListResult` | req/resp | Issuer-signed status-list update |
+| `Delete` / `DeleteResult` | req/resp | Authenticated record deletion |
+| `FindNode` / `FindNodeResult` | req/resp | Kademlia FIND_NODE |
+| `FindValue` / `FindValueHit` / `FindValueNodes` | req/resp | Kademlia FIND_VALUE |
+| `Leave` | fire-and-forget | Graceful departure, removes node from routing table |
+
+All RPCs are serialised with `bincode` and framed with a `(msg_id: u32, is_request: bool, message)` envelope. Responses are correlated via `msg_id` through a `PendingMap`.
 
 ## Key invariants
 - Records are **immutable after creation**: `rpc_store` rejects duplicate keys.
 - `set()` calls `get()` first — returns `None` if the key already exists.
-- Updates require `auth_signature = sign(new_record, old_private_key)`.
+- Updates require `auth_signature = sign(new_record_bytes, old_private_key)`.
+  `verify_key_rotation()` checks: (1) auth_sig valid under old public key, (2) new record self-signed.
+  **Downgrade attacks are impossible**: to submit `record_v1` as "new" when `record_v2`
+  is stored, an attacker would need to sign with `sk_v2` — which they do not possess.
 - Deletes require `auth_signature = sign(delete_msg, owner_private_key)`.
 - DHT key = `digest(did_uuid_string)` where `digest` is SHA-1 → `[u8; 20]`.
 - `STATUS_LIST_KEY = digest("did:iiot:status-list")` uses issuer-node
   verification instead of DID-owner verification.
+- `issuer.bin` is read lazily; if absent, a `log::warn!` is emitted at startup
+  and only `STATUS_LIST_KEY` operations are affected (normal DID records are not).
+
+## Test suite structure
+| File | Count | Notes |
+|---|---|---|
+| `tests/network_tests.rs` | 8 | Full multi-node integration tests (real UDP) |
+| `tests/crypto_tests.rs` | 27 | Crypto layer unit + DID handler unit tests |
+| `tests/routing_tests.rs` | 20 | Routing table unit tests |
+| `tests/storage_tests.rs` | 17 | `ForgetfulStorage` unit tests |
+| `tests/dht_integration.rs` | 1 | Legacy 3-node end-to-end scenario |
+| `src/**` (inline) | 53 | Module-level `#[test]` blocks |
+
+All tests are network-clean (loopback only) and run in parallel without interference when port ranges are respected.
 
 ## Test port allocation (run in parallel — do not reuse)
 | Range | Test |
@@ -74,8 +116,9 @@ Constants: `FRAG_CHUNK_SIZE=1400`, `FRAG_HEADER_LEN=12`,
 | 15740–15741 | authenticated delete |
 | 15750 | invalid signature rejection |
 | 15760 | unreachable peer |
+| 15780–15781 | update rejected on invalid new-record self-signature |
 
-When adding a new integration test use ports **15770+** and document them here.
+When adding a new integration test use ports **15782+** and document them here.
 
 ## Docker
 ```
@@ -87,8 +130,8 @@ Environment variables per container: `NODE_PORT`, `IS_SEED`, `BOOTSTRAP_ADDR`,
 `ROLE` (`publisher`|`retriever`), `FIXED_DID_UUID`, `RETRIEVE_KEY`, `RUST_LOG`.
 
 ## Adding a new crypto algorithm
-1. Implement `SignatureVerifier` in `src/crypto/<alg>.rs`.
-2. Register in `src/crypto/factory.rs` → `SignatureVerifierFactory::create()`.
+1. Implement `SignatureVerifier` (and optionally `Signer`) in `src/crypto/<alg>.rs`.
+2. Register in `src/crypto/factory.rs` → `SignatureVerifierFactory::create()` and `SignerFactory::create()`.
 3. Add the algorithm string + signature length to `resolve_alg_and_length()` in
    `src/crypto/signature_verifier.rs`.
 4. Add tests in `tests/crypto_tests.rs`.
@@ -98,3 +141,7 @@ Environment variables per container: `NODE_PORT`, `IS_SEED`, `BOOTSTRAP_ADDR`,
 - Do not increase `MAX_MESSAGE_SIZE` without a matching memory-budget review.
 - Do not add `unwrap()` in protocol/network paths — use `?` or log + return.
 - Do not add new integration tests on already-used port ranges.
+- Do not enable the `python` feature in Rust-only deployments (`cdylib` changes linking).
+- Do not add an `"updated"` timestamp field to DID Documents for ordering: downgrade
+  attacks are already prevented by the auth-signature chain; the field would be
+  redundant and would break compatibility with existing records without a migration.

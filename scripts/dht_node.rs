@@ -128,7 +128,14 @@ fn decode_record(record: &[u8]) -> Option<String> {
 
 
 async fn start_server(port: u16) -> Server {
-    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
+    let issuer_path = PathBuf::from("issuer.bin");
+    if !issuer_path.exists() {
+        log::warn!(
+            "issuer.bin not found — STATUS_LIST_KEY verification will fail. \
+             Normal DID record operations are unaffected."
+        );
+    }
+    let handler = Arc::new(DIDSignatureVerifierHandler::new(issuer_path));
     let mut server = Server::new(handler, 20, 3, None, None);
     server.listen(port, "0.0.0.0").await.expect("Failed to bind UDP socket");
     log::info!("Node listening on 0.0.0.0:{}", port);
