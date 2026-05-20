@@ -87,6 +87,7 @@ All RPCs are serialised with `bincode` and framed with a `(msg_id: u32, is_reque
 - All RPC handlers use `self: &Arc<Self>` receiver to enable `tokio::spawn` without cloning the full struct. `welcome_if_new` is always fire-and-forget.
 - UDP receive loop dispatches through `mpsc::channel(1024)` → 4 fixed workers. Backpressure is applied when the channel is full.
 - `SignatureCache` is keyed on `SHA-256(record_bytes)`. TTL 1 h, capacity 4096. Eviction = cache miss = full re-verification (never a security bypass).
+- `welcome_if_new` replication uses two conditions (Kademlia §2.5, matches Python AuthKademlia): `new_node_close` (new node is XOR-closer than the farthest k-neighbor) AND `this_closest` (this node is closer than the nearest k-neighbor). Both must be true to replicate. Neighbors are computed before `add_contact` so the new node is excluded from comparisons.
 
 ## Key invariants
 - Records are **immutable after creation**: `rpc_store` rejects duplicate keys.

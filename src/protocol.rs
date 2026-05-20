@@ -801,8 +801,15 @@ impl KademliaProtocol {
     /// If `node` is new, add it to the routing table and replicate relevant
     /// keys to it (Kademlia §2.5 — new node integration).
     ///
-    /// Only keys for which this node is XOR-closer than the new node are
-    /// replicated, preventing redundant store RPCs from far-away nodes.
+    /// Replication conditions (matching the Python AuthKademlia semantics):
+    /// - `new_node_close`: the new node is XOR-closer to the key than the
+    ///   current farthest k-neighbor, meaning it would enter the k-set.
+    /// - `this_closest`: this node is the XOR-closest known node to the key,
+    ///   so only one node (the responsible one) pushes data to the newcomer.
+    /// - If no neighbors are known yet, replicate unconditionally.
+    ///
+    /// Neighbors are computed before `add_contact` so the new node is not
+    /// included in the distance comparisons (matches Python ordering).
     pub async fn welcome_if_new(self: &Arc<Self>, node: Node) {
         if !self.router.read().await.is_new_node(&node) {
             return;
@@ -811,9 +818,9 @@ impl KademliaProtocol {
 
         let all_entries = self.storage.iter_all();
         let self_node = self.source_node.clone();
-        let node_clone = node.clone();
 
         let keys_to_replicate: Vec<([u8; ID_LEN], Vec<u8>)> = {
+            let router = self.router.read().await;
             all_entries
                 .into_iter()
                 .filter_map(|(key_vec, value)| {
@@ -824,19 +831,30 @@ impl KademliaProtocol {
                     key.copy_from_slice(&key_vec);
                     let key_node = Node::from_id(key);
 
-                    // Replicate only if this node is XOR-closer to the key
-                    // than the new node (responsible-node invariant).
-                    let self_dist = self_node.distance_to(&key_node);
-                    let new_dist = node_clone.distance_to(&key_node);
-                    if self_dist < new_dist {
+                    let neighbors = router.find_neighbors(&key_node, None);
+
+                    let new_node_close = match neighbors.last() {
+                        Some(last) => node.distance_to(&key_node) < last.distance_to(&key_node),
+                        None => true,
+                    };
+                    let this_closest = match neighbors.first() {
+                        Some(first) => {
+                            self_node.distance_to(&key_node) < first.distance_to(&key_node)
+                        }
+                        None => true,
+                    };
+
+                    if new_node_close && this_closest {
                         Some((key, value))
                     } else {
                         None
                     }
                 })
                 .collect()
-        };
+        }; // router read lock released here
 
+        // Add contact after computing what to replicate (Python semantics:
+        // find_neighbors during the loop must not include the new node).
         self.router.write().await.add_contact(node.clone());
 
         for (key, value) in keys_to_replicate {
