@@ -174,29 +174,32 @@ fn test_bucket_splits_on_overflow() {
     );
 }
 
-/// A newly created routing table with no contacts has lonely buckets (< k/2 nodes).
+/// Per §2.3, a bucket is lonely if it hasn't been updated in over an hour.
+/// A freshly created routing table has just-touched buckets — none are lonely.
 #[test]
-fn test_lonely_bucket_on_empty_table() {
+fn test_fresh_table_has_no_lonely_buckets() {
     let local = make_node("lonely");
     let rt = RoutingTable::new(local, 20);
     assert!(
-        !rt.lonely_buckets().is_empty(),
-        "an empty routing table must have at least one lonely bucket"
+        rt.lonely_buckets().is_empty(),
+        "a freshly created routing table should have no lonely buckets (time-based §2.3)"
     );
 }
 
-/// A bucket is not lonely once it has at least k/2 nodes.
+/// Adding nodes touches the bucket's last_updated timestamp, so it remains
+/// non-lonely regardless of node count.
 #[test]
-fn test_bucket_not_lonely_when_half_full() {
+fn test_bucket_not_lonely_after_add() {
     let ksize = 4;
     let local = make_node("local_full");
     let mut rt = RoutingTable::new(local.clone(), ksize);
 
-    // Insert k/2 = 2 nodes; bucket should no longer be lonely.
     rt.add_contact(make_node("p1"));
     rt.add_contact(make_node("p2"));
 
-    // find_neighbors confirms they're present
+    // Bucket was just updated — not lonely.
+    assert!(rt.lonely_buckets().is_empty());
+    // And the nodes are actually present.
     let found = rt.find_neighbors(&make_node("any"), None);
     assert!(found.len() >= 2);
 }

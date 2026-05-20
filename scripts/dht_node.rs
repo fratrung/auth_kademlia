@@ -132,7 +132,7 @@ async fn start_server(port: u16) -> Server {
         );
     }
     let handler = Arc::new(DIDSignatureVerifierHandler::new(issuer_path));
-    let mut server = Server::new(handler, 20, 3, None, None);
+    let mut server = Server::new(handler, 20, 3, None, None, true);
     server
         .listen(port, "0.0.0.0")
         .await

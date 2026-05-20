@@ -146,7 +146,6 @@ mod tests {
         let s = ForgetfulStorage::new(1); // 1-second TTL
         s.set(b"k".to_vec(), b"v".to_vec());
         sleep(Duration::from_millis(1100));
-        // Lazy expiry: entry is gone on the next read
         assert_eq!(s.get(b"k"), None);
     }
 

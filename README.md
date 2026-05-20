@@ -88,6 +88,62 @@ By inspecting fragments you can identify the internal composition of a PQC recor
 | **Replication filter** | On node join, only nodes XOR-closer to a key than the new node replicate it (Kademlia §2.5). Prevents redundant store RPCs from far-away nodes. |
 | **Atomic insert** | `rpc_store` uses a DashMap `Entry`-based `insert_if_absent` — eliminates the TOCTOU race window that existed with the old read-then-write pattern. |
 
+### Stress test limits
+
+Measured on a single machine (3 local nodes, loopback, `examples/stress_test.rs`).
+Each operation is a full `set` → `get` round-trip including Dilithium-2 signature
+verification (~5 ms CPU per record).
+
+| Concurrency | Ops | Result |
+|---|---|---|
+| 10 | 1 000 | Stable — all ops succeed, p99 well under 5 s RPC timeout |
+| 20 | 1 000 | Stable |
+| 30 | 1 000 | Stable |
+| 50 | 1 000 | Stable — practical maximum for real-time use |
+| 60 | 1 000 | Degraded — Dilithium-2 CPU backlog starts to overflow the 5 s RPC timeout; occasional failures |
+| 80 | 1 000 | Unstable — node saturation; significant failure rate |
+
+**Bottleneck**: Dilithium-2 signature verification (~5 ms/record × 4 workers = ~800
+ops/s peak throughput). At concurrency ≥ 60, the verification queue grows faster
+than workers drain it and RPC calls begin to time out.
+
+**Mitigations already in place**: the shared `SignatureCache` means each unique
+record is verified at most once per hour. In production workloads with repeated
+reads the effective throughput is much higher than the raw numbers above.
+
+### Signature cache benchmark
+
+Measured with `examples/cache_bench.rs` — two isolated 3-node loopback clusters
+(one with `use_cache = true`, one with `use_cache = false`) running the same
+workload: SET a fresh DID Document, cold GET (first application-layer read),
+warm GET (second read of the same key).
+
+**Representative run — 300 ops, concurrency 20** (`cargo run --release --example cache_bench -- 300 20`):
+
+| Operation | Cached (avg) | Uncached (avg) | Speedup |
+|---|---|---|---|
+| SET | 6.6 ms | 7.7 ms | 1.2× |
+| GET cold | 38 µs | 98 µs | **2.6×** |
+| GET warm | 13 µs | 104 µs | **8.2×** |
+
+All runs (100–400 ops, concurrency 10–30): 0 failures, 0 data corruptions.
+
+**How to read the numbers:**
+
+- *SET*: marginally faster with cache because `rpc_store` handlers on the
+  receiving nodes benefit from cross-layer pre-warming (shared `Arc<SignatureCache>`
+  between `Server` and `KademliaProtocol`).
+- *GET cold*: the "cold" application-layer read is already a cache hit in the
+  cached case — when `call_store_rpc` delivers the record to a node, `rpc_store`
+  verifies and caches it in the same shared `SignatureCache` that `Server::get`
+  later queries. So the first `get()` call sees a cache hit instead of a
+  Dilithium-2 re-verification.
+- *GET warm*: the primary signal — SHA-256 cache lookup (~12 µs) vs full
+  Dilithium-2 re-verification (~100 µs) = **5–8× speedup** depending on load.
+
+The cache can be disabled per-node (`Server::new(..., use_cache: false)`) for
+security auditing or benchmarking without touching any other code path.
+
 -----
 
 ## DID:IIoT Integration

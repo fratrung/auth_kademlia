@@ -1,12 +1,14 @@
 /// Kademlia routing table with binary bucket splitting.
 ///
-/// The routing table maintains a list of K-buckets, each covering a contiguous
-/// range of the 128-bit XOR keyspace. When a bucket is full and contains the
-/// local node's ID range, it is split into two halves. This ensures that the
-/// table has fine-grained resolution near the local node and coarser resolution
-/// for distant peers — exactly as specified in the Kademlia paper.
+/// Follows the Python AuthKademlia implementation strictly:
+/// - KBucket has a primary `nodes` list and a `replacement_nodes` list (§4.1).
+/// - Bucket splits when full AND (covers local node OR depth % 5 != 0) (§4.2).
+/// - When split is not possible, the LRU head is returned to the caller for pinging.
+/// - `remove_node` promotes from replacement_nodes automatically.
+/// - Lonely buckets = not updated in the last hour (time-based, §2.3).
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;
+use std::time::Instant;
 
 use crate::node::Node;
 
@@ -14,66 +16,138 @@ use crate::node::Node;
 pub struct KBucket {
     /// The inclusive range `[lo, hi]` of `long_id` values this bucket covers.
     pub range: RangeInclusive<u128>,
-    /// Nodes in LRU order: the least-recently-seen node is at the front.
+    /// Primary node list in LRU order (least-recently-seen at front).
     nodes: VecDeque<Node>,
-    /// Maximum number of nodes (`k` in the Kademlia paper).
+    /// Overflow list: nodes that arrived when the bucket was full (§4.1).
+    replacement_nodes: VecDeque<Node>,
+    /// Maximum number of primary nodes (`k`).
     ksize: usize,
+    /// Cap on replacement list size (`k * 5`, matching Python default).
+    max_replacement_nodes: usize,
+    /// Timestamp of last successful add/refresh — used for lonely-bucket detection.
+    last_updated: Instant,
 }
 
 impl KBucket {
-    /// Create an empty bucket covering `range`.
     pub fn new(range: RangeInclusive<u128>, ksize: usize) -> Self {
         Self {
             range,
             nodes: VecDeque::new(),
+            replacement_nodes: VecDeque::new(),
             ksize,
+            max_replacement_nodes: ksize * 5,
+            last_updated: Instant::now(),
         }
     }
 
     /// Insert or refresh `node`.
     ///
-    /// If the node is already known it is moved to the tail (most-recently-seen
-    /// position). If the bucket has spare capacity the node is appended.
-    ///
-    /// Returns `true` if the node was inserted or refreshed, `false` if the
-    /// bucket is full and the node could not be added.
+    /// - Already known → move to MRU tail, return `true`.
+    /// - Bucket has capacity → append, return `true`.
+    /// - Bucket full → add to replacement list (capped), return `false`.
     pub fn add_node(&mut self, node: Node) -> bool {
-        // Refresh: move to back if already present.
         if let Some(pos) = self.nodes.iter().position(|n| n.id == node.id) {
             self.nodes.remove(pos);
             self.nodes.push_back(node);
+            self.last_updated = Instant::now();
             return true;
         }
         if self.nodes.len() < self.ksize {
             self.nodes.push_back(node);
-            true
-        } else {
-            false // bucket full
+            self.last_updated = Instant::now();
+            return true;
+        }
+        // Bucket full: refresh position in replacement list if already there,
+        // otherwise append. Cap at max_replacement_nodes (evict oldest).
+        if let Some(pos) = self.replacement_nodes.iter().position(|n| n.id == node.id) {
+            self.replacement_nodes.remove(pos);
+        }
+        self.replacement_nodes.push_back(node);
+        while self.replacement_nodes.len() > self.max_replacement_nodes {
+            self.replacement_nodes.pop_front();
+        }
+        false
+    }
+
+    /// Remove `node` from the primary list. If a replacement node is available,
+    /// it is promoted automatically (§4.1).
+    pub fn remove_node(&mut self, node: &Node) {
+        self.replacement_nodes.retain(|n| n.id != node.id);
+        if let Some(pos) = self.nodes.iter().position(|n| n.id == node.id) {
+            self.nodes.remove(pos);
+            if let Some(replacement) = self.replacement_nodes.pop_back() {
+                self.nodes.push_back(replacement);
+            }
         }
     }
 
-    /// Remove `node` from the bucket.
-    pub fn remove_node(&mut self, node: &Node) {
-        self.nodes.retain(|n| n.id != node.id);
-    }
-
-    /// Return `true` if `node` is in the bucket.
+    /// Return `true` if `node` is in the primary list.
     pub fn contains(&self, node: &Node) -> bool {
         self.nodes.iter().any(|n| n.id == node.id)
     }
 
-    /// A bucket is "lonely" if it has fewer than `k/2` nodes and therefore
-    /// needs a refresh crawl.
-    pub fn is_lonely(&self) -> bool {
-        self.nodes.len() < (self.ksize / 2).max(1)
+    /// Split this bucket at its midpoint into two new buckets.
+    /// Both primary nodes and replacement nodes are redistributed (matches Python).
+    pub fn split(self) -> (KBucket, KBucket) {
+        let lo = *self.range.start();
+        let hi = *self.range.end();
+        let mid = lo + (hi - lo) / 2;
+
+        let mut low = KBucket::new(lo..=mid, self.ksize);
+        let mut high = KBucket::new(mid + 1..=hi, self.ksize);
+
+        for n in self.nodes.into_iter().chain(self.replacement_nodes.into_iter()) {
+            if n.long_id <= mid {
+                low.add_node(n);
+            } else {
+                high.add_node(n);
+            }
+        }
+        (low, high)
     }
 
-    /// Immutable view of the node list (LRU order).
+    /// Length of the shared binary prefix (in bits) of all primary node IDs.
+    /// Used by the §4.2 split condition: also split when depth % 5 != 0.
+    pub fn depth(&self) -> usize {
+        if self.nodes.len() < 2 {
+            return if self.nodes.is_empty() {
+                0
+            } else {
+                self.nodes[0].id.len() * 8
+            };
+        }
+        let first = &self.nodes[0].id;
+        let mut prefix_len = 0;
+        'outer: for byte_idx in 0..first.len() {
+            for shift in (0..8).rev() {
+                let bit = (first[byte_idx] >> shift) & 1;
+                for node in self.nodes.iter().skip(1) {
+                    if ((node.id[byte_idx] >> shift) & 1) != bit {
+                        break 'outer;
+                    }
+                }
+                prefix_len += 1;
+            }
+        }
+        prefix_len
+    }
+
+    /// A bucket is "lonely" if it hasn't been updated in the last hour (§2.3).
+    pub fn is_lonely(&self) -> bool {
+        self.last_updated.elapsed().as_secs() > 3600
+    }
+
+    /// Least-recently-seen node (LRU head). Caller should ping it when the
+    /// bucket is full and cannot be split (§4.2).
+    pub fn head(&self) -> Option<&Node> {
+        self.nodes.front()
+    }
+
+    /// Immutable view of the primary node list (LRU order).
     pub fn nodes(&self) -> &VecDeque<Node> {
         &self.nodes
     }
 
-    /// Number of nodes currently in the bucket.
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -82,27 +156,20 @@ impl KBucket {
         self.nodes.is_empty()
     }
 
-    /// Return `true` if this bucket's range contains `long_id`.
     pub fn covers(&self, long_id: u128) -> bool {
         self.range.contains(&long_id)
     }
 }
 
 /// Maintains a list of K-buckets that together partition the entire 128-bit
-/// XOR keyspace. Buckets are split when they are full *and* cover the local
-/// node's ID, so the table has high resolution near the local node.
+/// XOR keyspace.
 pub struct RoutingTable {
-    /// The local node.
     pub node: Node,
-    /// Maximum bucket size (`k`).
     ksize: usize,
-    /// Ordered list of K-buckets. The list is always sorted by the lower bound
-    /// of each bucket's range.
     buckets: Vec<KBucket>,
 }
 
 impl RoutingTable {
-    /// Create a routing table with a single bucket spanning the full keyspace.
     pub fn new(node: Node, ksize: usize) -> Self {
         let bucket = KBucket::new(0..=u128::MAX, ksize);
         Self {
@@ -114,47 +181,41 @@ impl RoutingTable {
 
     /// Add a contact to the routing table.
     ///
-    /// If the target bucket is full and covers the local node's ID, the bucket
-    /// is split and insertion is retried. Otherwise the node is silently
-    /// discarded (as per the Kademlia paper).
-    pub fn add_contact(&mut self, node: Node) {
+    /// Returns `Some(lru_node)` when the target bucket is full and cannot be
+    /// split. The caller is responsible for pinging `lru_node` and evicting it
+    /// via `remove_contact` if it does not respond (§4.2).
+    pub fn add_contact(&mut self, node: Node) -> Option<Node> {
         if node.id == self.node.id {
-            return;
+            return None;
         }
-        self.insert(node);
+        self.insert(node)
     }
 
-    /// Recursive helper so `split_bucket` can call `insert` cleanly.
-    fn insert(&mut self, node: Node) {
+    fn insert(&mut self, node: Node) -> Option<Node> {
         let idx = self.bucket_index_for(node.long_id);
         if self.buckets[idx].add_node(node.clone()) {
-            return;
+            return None;
         }
-        // Bucket full. Split only if it covers the local node.
-        if self.buckets[idx].covers(self.node.long_id) {
+        // §4.2: split if bucket covers local node OR if depth % 5 != 0.
+        if self.buckets[idx].covers(self.node.long_id) || self.buckets[idx].depth() % 5 != 0 {
             self.split_bucket(idx);
-            self.insert(node); // retry after split
+            return self.insert(node);
         }
-        // Otherwise silently discard — the LRU head should be pinged in a
-        // full implementation (§2.2 of the Kademlia paper).
+        // Cannot split: return LRU head so the caller can ping it.
+        self.buckets[idx].head().cloned()
     }
 
-    /// Remove a contact (called when a node sends a `leave` RPC).
     pub fn remove_contact(&mut self, node: &Node) {
         let idx = self.bucket_index_for(node.long_id);
         self.buckets[idx].remove_node(node);
     }
 
-    /// Return `true` if `node` is not yet in any bucket.
     pub fn is_new_node(&self, node: &Node) -> bool {
         let idx = self.bucket_index_for(node.long_id);
         !self.buckets[idx].contains(node)
     }
 
     /// Return the `k` nodes closest to `target`, optionally excluding one node.
-    ///
-    /// Collects candidates from all buckets, sorts by XOR distance to
-    /// `target`, and returns at most `ksize` results.
     pub fn find_neighbors(&self, target: &Node, exclude: Option<&Node>) -> Vec<Node> {
         let mut candidates: Vec<Node> = self
             .buckets
@@ -168,45 +229,19 @@ impl RoutingTable {
         candidates
     }
 
-    /// Return buckets that are lonely and therefore need a refresh crawl.
     pub fn lonely_buckets(&self) -> Vec<&KBucket> {
         self.buckets.iter().filter(|b| b.is_lonely()).collect()
     }
 
-    /// Split bucket at `idx` into two equal halves.
-    ///
-    /// The midpoint is `lo + (hi - lo) / 2`. All existing nodes are
-    /// redistributed into the appropriate half.
+    /// Split the bucket at `idx` using `KBucket::split()`, which distributes
+    /// both primary nodes and replacement nodes into the two halves.
     fn split_bucket(&mut self, idx: usize) {
-        let range = self.buckets[idx].range.clone();
-        let lo = *range.start();
-        let hi = *range.end();
-        let mid = lo + (hi - lo) / 2;
-
-        let existing_nodes: Vec<Node> = self.buckets[idx].nodes().iter().cloned().collect();
-
-        let mut low_bucket = KBucket::new(lo..=mid, self.ksize);
-        let mut high_bucket = KBucket::new(mid + 1..=hi, self.ksize);
-
-        for n in existing_nodes {
-            if n.long_id <= mid {
-                low_bucket.add_node(n);
-            } else {
-                high_bucket.add_node(n);
-            }
-        }
-
-        // Replace the old bucket with the two new halves.
-        self.buckets.remove(idx);
-        self.buckets.insert(idx, high_bucket);
-        self.buckets.insert(idx, low_bucket);
+        let bucket = self.buckets.remove(idx);
+        let (low, high) = bucket.split();
+        self.buckets.insert(idx, high);
+        self.buckets.insert(idx, low);
     }
 
-    /// Return the index of the bucket whose range contains `long_id`.
-    ///
-    /// Uses a linear scan over the (typically small) bucket list. For very
-    /// large networks a binary search would be faster, but this matches the
-    /// Python implementation's simplicity.
     fn bucket_index_for(&self, long_id: u128) -> usize {
         self.buckets
             .iter()
@@ -258,15 +293,29 @@ mod tests {
     }
 
     #[test]
+    fn replacement_node_promoted_on_eviction() {
+        let local = make_node("local");
+        let ksize = 1;
+        let mut rt = RoutingTable::new(local.clone(), ksize);
+        let peer_a = make_node("peer_a");
+        let peer_b = make_node("peer_b");
+        // Fill bucket with peer_a, then add peer_b to replacement list.
+        rt.add_contact(peer_a.clone());
+        rt.add_contact(peer_b.clone());
+        // Remove peer_a — peer_b should be promoted.
+        rt.remove_contact(&peer_a);
+        let found = rt.find_neighbors(&make_node("target"), None);
+        assert!(found.iter().any(|n| n.id == peer_b.id));
+    }
+
+    #[test]
     fn bucket_splits_on_overflow() {
         let local = make_node("local");
         let ksize = 2;
         let mut rt = RoutingTable::new(local.clone(), ksize);
-        // Insert more than ksize nodes — the table must split.
         for i in 0..20 {
             rt.add_contact(make_node(&format!("peer{}", i)));
         }
-        // The table should still return at most ksize neighbors.
         let found = rt.find_neighbors(&make_node("target"), None);
         assert!(found.len() <= ksize);
     }

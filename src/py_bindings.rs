@@ -111,7 +111,7 @@ impl PyServer {
             None => None,
         };
 
-        let server = Server::new(handler, ksize, alpha, fixed_id, None);
+        let server = Server::new(handler, ksize, alpha, fixed_id, None, true);
         Ok(Self {
             inner: Arc::new(RwLock::new(server)),
         })

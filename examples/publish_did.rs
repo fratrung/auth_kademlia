@@ -165,7 +165,7 @@ async fn start_node(port: u16) -> Server {
     )));
 
     // Create a new Server: ksize=20, alpha=3
-    let mut server = Server::new(handler, 20, 3, None, None);
+    let mut server = Server::new(handler, 20, 3, None, None, true);
 
     // Start listening on the specified port
     server.listen(port, "127.0.0.1").await.unwrap();

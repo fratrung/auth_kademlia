@@ -167,7 +167,7 @@ fn new_did() -> (String, String, Vec<u8>, dilithium2::SecretKey) {
 
 async fn start_node(port: u16) -> Arc<Server> {
     let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
-    let mut server = Server::new(handler, 20, 3, None, None);
+    let mut server = Server::new(handler, 20, 3, None, None, true);
     server.listen(port, "127.0.0.1").await.expect("listen failed");
     Arc::new(server)
 }

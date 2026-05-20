@@ -140,7 +140,9 @@ pub struct KademliaProtocol {
     pub source_node: Node,
     pub socket: Arc<UdpSocket>,
     pub signature_handler: Arc<dyn SignatureVerifierHandler>,
-    sig_cache: SignatureCache,
+    /// Shared with `Server` so a verification result cached in one layer is
+    /// immediately reused by the other. `None` when the cache is disabled.
+    sig_cache: Option<Arc<SignatureCache>>,
     pending: PendingMap,
     next_msg_id: AtomicU32,
     next_frag_id: AtomicU32,
@@ -154,6 +156,7 @@ impl KademliaProtocol {
         storage: Arc<ForgetfulStorage>,
         ksize: usize,
         signature_handler: Arc<dyn SignatureVerifierHandler>,
+        sig_cache: Option<Arc<SignatureCache>>,
     ) -> Self {
         let router = RoutingTable::new(source_node.clone(), ksize);
         Self {
@@ -162,7 +165,7 @@ impl KademliaProtocol {
             source_node,
             socket,
             signature_handler,
-            sig_cache: SignatureCache::new(4096),
+            sig_cache,
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_msg_id: AtomicU32::new(0),
             next_frag_id: AtomicU32::new(0),
@@ -264,7 +267,6 @@ impl KademliaProtocol {
     /// Responses are routed to waiting `call()` callers via the pending map.
     /// Requests are handled inline and a response is sent back.
     pub async fn handle_datagram(self: &Arc<Self>, data: Vec<u8>, peer: SocketAddr) {
-        // Step 1: parse fragment header.
         let (header, chunk) = match parse_fragment(&data) {
             Some(parts) => parts,
             None => {
@@ -276,8 +278,7 @@ impl KademliaProtocol {
             }
         };
 
-        // Step 2: reassemble. Single-fragment messages are handled without
-        // touching the reassembly map for the common case.
+        // Single-fragment messages bypass the reassembly map (common case).
         let payload: Vec<u8> = if header.total == 1 {
             chunk.to_vec()
         } else {
@@ -296,8 +297,7 @@ impl KademliaProtocol {
             let key = (peer, header.frag_id);
             let mut map = self.reassembly.lock().await;
 
-            // Insert/get entry, validate consistency, and record the chunk in
-            // a scope that releases the &mut borrow before we call remove().
+            // Scope releases the `map` &mut borrow before `map.remove()` below.
             let complete = {
                 let entry = map
                     .entry(key)
@@ -318,12 +318,10 @@ impl KademliaProtocol {
 
             if !complete {
                 drop(map);
-                // Opportunistic GC of stale buffers.
                 self.gc_reassembly().await;
                 return;
             }
 
-            // All fragments received: take ownership and assemble.
             let entry = map.remove(&key).expect("entry checked above");
             drop(map);
             match entry.assemble() {
@@ -339,7 +337,6 @@ impl KademliaProtocol {
             }
         };
 
-        // Step 3: deserialize and dispatch.
         let frame: Frame = match bincode::deserialize(&payload) {
             Ok(f) => f,
             Err(e) => {
@@ -478,7 +475,6 @@ impl KademliaProtocol {
             log::error!("rpc_store: record {} already exists", hex::encode(key));
             return false;
         }
-        // Routing table update does not block the RPC response.
         let source = Node::new(sender_id, Some(sender_addr.0), Some(sender_addr.1));
         let p = Arc::clone(self);
         tokio::spawn(async move { p.welcome_if_new(source).await });
@@ -511,7 +507,6 @@ impl KademliaProtocol {
             );
             return false;
         }
-        // Routing table update does not block the RPC response.
         let source = Node::new(sender_id, Some(sender_addr.0), Some(sender_addr.1));
         let p = Arc::clone(self);
         tokio::spawn(async move { p.welcome_if_new(source).await });
@@ -541,7 +536,6 @@ impl KademliaProtocol {
             log::error!("rpc_update_status_list: unauthenticated update");
             return false;
         }
-        // Routing table update does not block the RPC response.
         let source = Node::new(sender_id, Some(sender_addr.0), Some(sender_addr.1));
         let p = Arc::clone(self);
         tokio::spawn(async move { p.welcome_if_new(source).await });
@@ -572,7 +566,6 @@ impl KademliaProtocol {
             log::error!("rpc_delete: invalid signature for {}", hex::encode(key));
             return false;
         }
-        // Routing table update does not block the RPC response.
         let source = Node::new(sender_id, Some(sender_addr.0), Some(sender_addr.1));
         let p = Arc::clone(self);
         tokio::spawn(async move { p.welcome_if_new(source).await });
@@ -587,7 +580,6 @@ impl KademliaProtocol {
         key: [u8; ID_LEN],
     ) -> Vec<Node> {
         let source = Node::new(sender_id, Some(sender_addr.0.clone()), Some(sender_addr.1));
-        // Routing table update does not block the RPC response.
         let p = Arc::clone(self);
         let src_clone = source.clone();
         tokio::spawn(async move { p.welcome_if_new(src_clone).await });
@@ -604,7 +596,12 @@ impl KademliaProtocol {
         sender_addr: (String, u16),
         key: [u8; ID_LEN],
     ) -> FindValueResult {
-        // welcome_if_new is already fired inside rpc_find_node below; no double spawn needed
+        // Python always calls welcome_if_new(source) unconditionally at the top of
+        // rpc_find_value, before checking storage. Mirror that here for both branches.
+        let source = Node::new(sender_id, Some(sender_addr.0.clone()), Some(sender_addr.1));
+        let p = Arc::clone(self);
+        tokio::spawn(async move { p.welcome_if_new(source).await });
+
         match self.storage.get(&key) {
             Some(v) => FindValueResult::Value(v),
             None => {
@@ -659,8 +656,15 @@ impl KademliaProtocol {
             )
             .await
         {
-            Some(RpcMessage::StoreResult { ok }) => ok,
-            _ => false,
+            Some(RpcMessage::StoreResult { ok }) => {
+                self.router.write().await.add_contact(peer.clone());
+                ok
+            }
+            _ => {
+                log::warn!("no response from {}, removing from router", peer);
+                self.router.write().await.remove_contact(peer);
+                false
+            }
         }
     }
 
@@ -691,8 +695,15 @@ impl KademliaProtocol {
             )
             .await
         {
-            Some(RpcMessage::UpdateResult { ok }) => ok,
-            _ => false,
+            Some(RpcMessage::UpdateResult { ok }) => {
+                self.router.write().await.add_contact(peer.clone());
+                ok
+            }
+            _ => {
+                log::warn!("no response from {}, removing from router", peer);
+                self.router.write().await.remove_contact(peer);
+                false
+            }
         }
     }
 
@@ -721,8 +732,15 @@ impl KademliaProtocol {
             )
             .await
         {
-            Some(RpcMessage::UpdateStatusListResult { ok }) => ok,
-            _ => false,
+            Some(RpcMessage::UpdateStatusListResult { ok }) => {
+                self.router.write().await.add_contact(peer.clone());
+                ok
+            }
+            _ => {
+                log::warn!("no response from {}, removing from router", peer);
+                self.router.write().await.remove_contact(peer);
+                false
+            }
         }
     }
 
@@ -753,8 +771,15 @@ impl KademliaProtocol {
             )
             .await
         {
-            Some(RpcMessage::DeleteResult { ok }) => ok,
-            _ => false,
+            Some(RpcMessage::DeleteResult { ok }) => {
+                self.router.write().await.add_contact(peer.clone());
+                ok
+            }
+            _ => {
+                log::warn!("no response from {}, removing from router", peer);
+                self.router.write().await.remove_contact(peer);
+                false
+            }
         }
     }
 
@@ -781,8 +806,10 @@ impl KademliaProtocol {
     /// Verify `value` for `key`, using the signature cache to skip redundant
     /// PQ crypto on repeated calls with the same record bytes.
     fn verify_for_key(&self, key: &[u8; ID_LEN], value: &[u8]) -> bool {
-        if let Some(cached) = self.sig_cache.get(value) {
-            return cached;
+        if let Some(cache) = &self.sig_cache {
+            if let Some(cached) = cache.get(value) {
+                return cached;
+            }
         }
         let status_list_key = digest(STATUS_LIST_KEY);
         let result = if *key == status_list_key {
@@ -794,7 +821,9 @@ impl KademliaProtocol {
                 .handle_signature_verification(value)
                 .unwrap_or(false)
         };
-        self.sig_cache.insert(value, result);
+        if let Some(cache) = &self.sig_cache {
+            cache.insert(value, result);
+        }
         result
     }
 
@@ -810,6 +839,10 @@ impl KademliaProtocol {
     ///
     /// Neighbors are computed before `add_contact` so the new node is not
     /// included in the distance comparisons (matches Python ordering).
+    ///
+    /// If `add_contact` returns an LRU node to ping (bucket full, can't split),
+    /// a background ping is fired. If the LRU node is unresponsive it is evicted
+    /// and its replacement is promoted automatically (§4.1/§4.2).
     pub async fn welcome_if_new(self: &Arc<Self>, node: Node) {
         if !self.router.read().await.is_new_node(&node) {
             return;
@@ -853,26 +886,57 @@ impl KademliaProtocol {
                 .collect()
         }; // router read lock released here
 
-        // Add contact after computing what to replicate (Python semantics:
-        // find_neighbors during the loop must not include the new node).
-        self.router.write().await.add_contact(node.clone());
+        // Add contact after computing what to replicate. If the bucket is full
+        // and cannot be split, fire a background ping on the LRU node (§4.2).
+        let lru = self.router.write().await.add_contact(node.clone());
+        if let Some(lru_node) = lru {
+            let p = Arc::clone(self);
+            tokio::spawn(async move { p.call_ping_node(&lru_node).await });
+        }
 
         for (key, value) in keys_to_replicate {
-            self.call_store_rpc(&node, key, value).await;
+            let p = Arc::clone(self);
+            let n = node.clone();
+            tokio::spawn(async move { p.call_store_rpc(&n, key, value).await });
         }
     }
 
-    /// Return a random ID for each bucket that needs refreshing.
+    /// Ping `node` to check liveness (§4.2 LRU eviction).
+    ///
+    /// On failure the node is removed and its replacement (if any) is promoted
+    /// automatically by `remove_node`. On success the Pong response triggers
+    /// `welcome_if_new` in `handle_datagram`, refreshing the routing table.
+    pub async fn call_ping_node(self: &Arc<Self>, node: &Node) {
+        let addr = match node.address() {
+            Some(a) => a,
+            None => return,
+        };
+        let (ok, _) = self.call_ping_addr(&addr).await;
+        if !ok {
+            log::warn!("LRU ping: no response from {}, evicting", node);
+            self.router.write().await.remove_contact(node);
+        }
+        // On success: Pong received in handle_datagram already calls welcome_if_new.
+    }
+
+    /// Return a random ID for each lonely bucket, constrained to that bucket's
+    /// keyspace range (§2.3). Matches Python: `random.randint(*bucket.range).to_bytes(20, 'big')`.
     pub async fn get_refresh_ids(&self) -> Vec<[u8; ID_LEN]> {
-        use rand::RngCore;
+        use rand::Rng;
         self.router
             .read()
             .await
             .lonely_buckets()
             .iter()
-            .map(|_| {
+            .map(|b| {
+                let lo = *b.range.start();
+                let hi = *b.range.end();
+                // Generate a random u128 within [lo, hi], then encode into 20 bytes.
+                // id[0..16] = r.to_be_bytes(), id[16..20] = 0 so that
+                // id_to_u128(id) == r (the XOR-fold term is zero).
+                let r: u128 = rand::thread_rng().gen_range(lo..=hi);
                 let mut id = [0u8; ID_LEN];
-                rand::thread_rng().fill_bytes(&mut id);
+                id[..16].copy_from_slice(&r.to_be_bytes());
                 id
             })
             .collect()
@@ -886,7 +950,7 @@ pub enum FindValueResult {
 
 #[async_trait]
 impl SpiderProtocol for KademliaProtocol {
-    async fn call_find_node(&self, peer: &Node, target: &Node) -> RawResponse {
+    async fn call_find_node(self: Arc<Self>, peer: Node, target: Node) -> RawResponse {
         let addr = match peer.address() {
             Some(a) => a,
             None => return RawResponse(false, FindPayload::Empty),
@@ -906,17 +970,23 @@ impl SpiderProtocol for KademliaProtocol {
             .await
         {
             Some(RpcMessage::FindNodeResult { nodes }) => {
+                let p = Arc::clone(&self);
+                tokio::spawn(async move { p.welcome_if_new(peer).await });
                 let tuples = nodes
                     .into_iter()
                     .map(|w| (w.id.to_vec(), w.ip, w.port))
                     .collect();
                 RawResponse(true, FindPayload::Nodes(tuples))
             }
-            _ => RawResponse(false, FindPayload::Empty),
+            _ => {
+                log::warn!("no response from {}, removing from router", peer);
+                self.router.write().await.remove_contact(&peer);
+                RawResponse(false, FindPayload::Empty)
+            }
         }
     }
 
-    async fn call_find_value(&self, peer: &Node, target: &Node) -> RawResponse {
+    async fn call_find_value(self: Arc<Self>, peer: Node, target: Node) -> RawResponse {
         let addr = match peer.address() {
             Some(a) => a,
             None => return RawResponse(false, FindPayload::Empty),
@@ -936,16 +1006,24 @@ impl SpiderProtocol for KademliaProtocol {
             .await
         {
             Some(RpcMessage::FindValueHit { value }) => {
+                let p = Arc::clone(&self);
+                tokio::spawn(async move { p.welcome_if_new(peer).await });
                 RawResponse(true, FindPayload::Value(value))
             }
             Some(RpcMessage::FindValueNodes { nodes }) => {
+                let p = Arc::clone(&self);
+                tokio::spawn(async move { p.welcome_if_new(peer).await });
                 let tuples = nodes
                     .into_iter()
                     .map(|w| (w.id.to_vec(), w.ip, w.port))
                     .collect();
                 RawResponse(true, FindPayload::Nodes(tuples))
             }
-            _ => RawResponse(false, FindPayload::Empty),
+            _ => {
+                log::warn!("no response from {}, removing from router", peer);
+                self.router.write().await.remove_contact(&peer);
+                RawResponse(false, FindPayload::Empty)
+            }
         }
     }
 

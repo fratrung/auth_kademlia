@@ -36,19 +36,15 @@ use serde_json::{json, Value};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-// ─── Topology parameters ─────────────────────────────────────────────────────
 
 /// First port of the 8-node cluster (15810–15817).
 const BASE_PORT: u16 = 15810;
 const NUM_NODES: usize = 30;
 /// Small k so records are stored only on the 3 closest nodes, forcing real lookups.
-const KSIZE: usize = 20;
-const ALPHA: usize = 3;
 
 const NUM_RECORDS: usize = 200;
 const OP_TIMEOUT: Duration = Duration::from_secs(10);
 
-// ─── Record helpers ───────────────────────────────────────────────────────────
 
 fn base64url(pk: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(pk)
@@ -135,23 +131,20 @@ fn extract_doc(record: &[u8]) -> Option<serde_json::Value> {
     serde_json::from_slice(&record[doc_start..]).ok()
 }
 
-// ─── Node factory ─────────────────────────────────────────────────────────────
 
-async fn start_node(port: u16) -> Arc<Server> {
+async fn start_node(port: u16, ksize: usize, alpha: usize) -> Arc<Server> {
     let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
-    let mut server = Server::new(handler, KSIZE, ALPHA, None, None);
+    let mut server = Server::new(handler, ksize, alpha, None, None, true);
     server.listen(port, "127.0.0.1").await.expect("listen failed");
     Arc::new(server)
 }
 
-// ─── Topology inspector ───────────────────────────────────────────────────────
 
 async fn print_topology(
     nodes: &[(Arc<Server>, u16)],
     key_to_did: &HashMap<String, String>,
     sample_records: &[(String, Vec<u8>)], // (did_uri, record) — printed as DID Documents
 ) {
-    // ── Sample DID Documents ──────────────────────────────────────────────────
     println!("━━━ Sample DID Documents ━━━━━━━━━━━━━━━━━━━━━━━\n");
     for (did, record) in sample_records {
         println!("  DID URI : {did}");
@@ -258,28 +251,30 @@ async fn print_topology(
     }
 }
 
-// ─── main ─────────────────────────────────────────────────────────────────────
-
 #[tokio::main]
 async fn main() {
+    // Parse optional CLI args: topology_test [ksize] [alpha]
+    let args: Vec<String> = std::env::args().collect();
+    let ksize: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let alpha: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);
+
     println!("╔══════════════════════════════════════════════╗");
     println!("║     AuthKademlia-RS  Topology Test           ║");
     println!("╚══════════════════════════════════════════════╝");
     println!("  Nodes    : {NUM_NODES}  (ports {BASE_PORT}–{})", BASE_PORT + NUM_NODES as u16 - 1);
-    println!("  k (ksize): {KSIZE}  → records stored on ≤{KSIZE} closest nodes only");
+    println!("  k (ksize): {ksize}  → records stored on ≤{ksize} closest nodes");
+    println!("  alpha    : {alpha}");
     println!("  Records  : {NUM_RECORDS}  published from random writers, read from random readers");
     println!("  Timeout  : {}s/op\n", OP_TIMEOUT.as_secs());
 
-    // ── Start cluster ─────────────────────────────────────────────────────────
     print!("Starting {NUM_NODES} nodes... ");
     let mut nodes: Vec<(Arc<Server>, u16)> = Vec::with_capacity(NUM_NODES);
     for i in 0..NUM_NODES {
         let port = BASE_PORT + i as u16;
-        nodes.push((start_node(port).await, port));
+        nodes.push((start_node(port, ksize, alpha).await, port));
     }
     println!("ok");
 
-    // ── Bootstrap: each node joins via the seed (node 0) ─────────────────────
     print!("Bootstrapping... ");
     let seed_port = BASE_PORT;
     for (server, _) in nodes.iter().skip(1) {
@@ -297,7 +292,6 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     println!("ok\n");
 
-    // ── Publish records ───────────────────────────────────────────────────────
     println!("━━━ Phase 1: Publish {NUM_RECORDS} Records ━━━━━━━━━━━━━━━━\n");
 
     // (did_uri, dht_key, record_bytes)
@@ -334,7 +328,6 @@ async fn main() {
     }
     println!("\n  Published: {set_ok}/{NUM_RECORDS}  ({set_fail} failed)\n");
 
-    // ── Retrieve records ──────────────────────────────────────────────────────
     println!("━━━ Phase 2: Retrieve Records ━━━━━━━━━━━━━━━━━━\n");
     println!("  (reader is always a different node than the expected holder — forces DHT lookup)\n");
 
@@ -389,7 +382,6 @@ async fn main() {
 
     println!("\n  Retrieved: {get_ok}/{set_ok}  ({get_fail} not found, {get_corrupt} corrupted)\n");
 
-    // ── Latency summary ───────────────────────────────────────────────────────
     println!("━━━ Latency Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
     fn stats(v: &mut Vec<u64>) -> (f64, u64, u64, u64) {
@@ -420,7 +412,6 @@ async fn main() {
     println!("  │ GET   │ {:>8} │ {:>8} │ {:>8} │ {:>8} │", fmt(ga as u64), fmt(gp50), fmt(gp95), fmt(gmax));
     println!("  └───────┴──────────┴──────────┴──────────┴──────────┘\n");
 
-    // ── Topology inspection ───────────────────────────────────────────────────
     // Build key→did_uri map and pick 3 sample records to show as full DID Documents
     let key_to_did: HashMap<String, String> = published
         .iter()
@@ -438,7 +429,6 @@ async fn main() {
 
     print_topology(&nodes, &key_to_did, &samples).await;
 
-    // ── Final verdict ─────────────────────────────────────────────────────────
     println!("━━━ Result ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     if get_fail == 0 && get_corrupt == 0 && set_fail == 0 {
         println!("  ALL CHECKS PASSED ✓\n");

@@ -31,10 +31,10 @@ pub struct Server {
     refresh_loop: Option<tokio::task::JoinHandle<()>>,
     save_state_loop: Option<tokio::task::JoinHandle<()>>,
     signature_handler: Arc<dyn SignatureVerifierHandler>,
-    // Cache verification results so repeated local reads of the same record
-    // don't pay full Dilithium cost. Any byte change → different SHA-256 key
-    // → cache miss → full re-verification. Safe to use even for local reads.
-    sig_cache: SignatureCache,
+    /// Shared with `KademliaProtocol` so a verification result cached at the
+    /// network layer (rpc_store) is immediately reused at the API layer (get/set)
+    /// and vice versa. `None` when the cache is disabled via `use_cache: false`.
+    sig_cache: Option<Arc<SignatureCache>>,
 }
 
 impl Server {
@@ -45,12 +45,17 @@ impl Server {
     /// - `alpha`             — concurrency factor (default 3).
     /// - `node_id`           — fixed node ID; pass `None` for a random one.
     /// - `storage`           — custom storage; pass `None` for the default.
+    /// - `use_cache`         — enable the signature verification cache (recommended:
+    ///                         `true`). Pass `false` to force full Dilithium
+    ///                         re-verification on every operation (useful for
+    ///                         benchmarking or security auditing).
     pub fn new(
         signature_handler: Arc<dyn SignatureVerifierHandler>,
         ksize: usize,
         alpha: usize,
         node_id: Option<[u8; ID_LEN]>,
         storage: Option<Arc<ForgetfulStorage>>,
+        use_cache: bool,
     ) -> Self {
         let storage = storage.unwrap_or_else(|| Arc::new(ForgetfulStorage::new(-1)));
 
@@ -64,6 +69,8 @@ impl Server {
             }
         };
 
+        let sig_cache = use_cache.then(|| Arc::new(SignatureCache::new(4096)));
+
         Self {
             ksize,
             alpha,
@@ -73,7 +80,7 @@ impl Server {
             refresh_loop: None,
             save_state_loop: None,
             signature_handler,
-            sig_cache: SignatureCache::new(4096),
+            sig_cache,
         }
     }
 
@@ -89,6 +96,7 @@ impl Server {
             Arc::clone(&self.storage),
             self.ksize,
             Arc::clone(&self.signature_handler),
+            self.sig_cache.clone(),
         ));
         self.protocol = Some(Arc::clone(&protocol));
 
@@ -104,13 +112,12 @@ impl Server {
                     let item = rx.lock().await.recv().await;
                     match item {
                         Some((data, peer)) => proto.handle_datagram(data, peer).await,
-                        None => break, // channel closed
+                        None => break,
                     }
                 }
             });
         }
 
-        // Recv loop: read datagrams and enqueue them.
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65_536];
             loop {
@@ -118,7 +125,7 @@ impl Server {
                     Ok((len, peer)) => {
                         let data = buf[..len].to_vec();
                         if tx.send((data, peer)).await.is_err() {
-                            break; // workers dropped
+                            break;
                         }
                     }
                     Err(e) => log::error!("UDP recv error: {}", e),
@@ -473,8 +480,10 @@ impl Server {
     }
 
     fn verify_value(&self, key: &str, value: &[u8]) -> bool {
-        if let Some(cached) = self.sig_cache.get(value) {
-            return cached;
+        if let Some(cache) = &self.sig_cache {
+            if let Some(cached) = cache.get(value) {
+                return cached;
+            }
         }
         let result = if key == STATUS_LIST_KEY {
             let ok = self
@@ -490,7 +499,9 @@ impl Server {
                 .handle_signature_verification(value)
                 .unwrap_or(false)
         };
-        self.sig_cache.insert(value, result);
+        if let Some(cache) = &self.sig_cache {
+            cache.insert(value, result);
+        }
         result
     }
 
@@ -578,7 +589,6 @@ impl Server {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 log::debug!("Routing table refresh triggered");
 
-                // Refresh lonely buckets.
                 let refresh_ids = proto.get_refresh_ids().await;
                 let mut futs = vec![];
                 for rid in refresh_ids {
@@ -590,7 +600,6 @@ impl Server {
                 }
                 futures::future::join_all(futs).await;
 
-                // Republish keys older than one hour.
                 let old_entries = storage.iter_older_than(3600);
                 for (key_vec, value) in old_entries {
                     if key_vec.len() != ID_LEN {

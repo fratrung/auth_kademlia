@@ -80,8 +80,9 @@ impl RPCFindResponse {
 /// This trait is implemented by `KademliaProtocol` and can be mocked in tests.
 #[async_trait::async_trait]
 pub trait SpiderProtocol: Send + Sync {
-    async fn call_find_node(&self, peer: &Node, target: &Node) -> RawResponse;
-    async fn call_find_value(&self, peer: &Node, target: &Node) -> RawResponse;
+    /// `Arc<Self>` receiver so implementations can spawn `welcome_if_new` tasks.
+    async fn call_find_node(self: Arc<Self>, peer: Node, target: Node) -> RawResponse;
+    async fn call_find_value(self: Arc<Self>, peer: Node, target: Node) -> RawResponse;
     async fn call_store(&self, peer: &Node, key: [u8; ID_LEN], value: Vec<u8>) -> bool;
 }
 
@@ -191,7 +192,7 @@ impl<P: SpiderProtocol + 'static> ValueSpiderCrawl<P> {
         let responses = self
             .base
             .find_round(
-                |proto, peer, node| async move { proto.call_find_value(&peer, &node).await },
+                |proto, peer, node| async move { proto.call_find_value(peer, node).await },
             )
             .await;
         self.nodes_found(responses).await
@@ -280,7 +281,7 @@ impl<P: SpiderProtocol + 'static> NodeSpiderCrawl<P> {
     async fn find_inner(mut self) -> Vec<Node> {
         let responses = self
             .base
-            .find_round(|proto, peer, node| async move { proto.call_find_node(&peer, &node).await })
+            .find_round(|proto, peer, node| async move { proto.call_find_node(peer, node).await })
             .await;
         self.nodes_found(responses).await
     }
