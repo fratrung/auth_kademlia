@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use log;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use crate::auth_handler::SignatureVerifierHandler;
 use crate::crawling::{NodeSpiderCrawl, ValueSpiderCrawl};
@@ -22,7 +22,7 @@ const STATUS_LIST_KEY: &str = "did:iiot:status-list";
 pub struct Server {
     pub ksize: usize,
     pub alpha: usize,
-    pub storage: Arc<Mutex<ForgetfulStorage>>,
+    pub storage: Arc<RwLock<ForgetfulStorage>>,
     pub node: Node,
     pub protocol: Option<Arc<KademliaProtocol>>,
     refresh_loop: Option<tokio::task::JoinHandle<()>>,
@@ -43,10 +43,10 @@ impl Server {
         ksize: usize,
         alpha: usize,
         node_id: Option<[u8; ID_LEN]>,
-        storage: Option<Arc<Mutex<ForgetfulStorage>>>,
+        storage: Option<Arc<RwLock<ForgetfulStorage>>>,
     ) -> Self {
         let storage =
-            storage.unwrap_or_else(|| Arc::new(Mutex::new(ForgetfulStorage::new(-1))));
+            storage.unwrap_or_else(|| Arc::new(RwLock::new(ForgetfulStorage::new(-1))));
 
         let node = match node_id {
             Some(id) => Node::from_id(id),
@@ -109,7 +109,7 @@ impl Server {
     /// Gracefully shut down: notify neighbours and cancel background tasks.
     pub async fn stop(&mut self) {
         if let Some(proto) = &self.protocol {
-            let neighbors = proto.router.lock().await.find_neighbors(&self.node, None);
+            let neighbors = proto.router.read().await.find_neighbors(&self.node, None);
             log::info!("Notifying {} neighbours of departure", neighbors.len());
             let mut tasks = vec![];
             for neighbor in neighbors {
@@ -182,14 +182,14 @@ impl Server {
         let dkey = digest(key);
 
         // Scope the lock so the MutexGuard is dropped before any await point.
-        let local: Option<Vec<u8>> = self.storage.lock().await.get(&dkey);
+        let local: Option<Vec<u8>> = self.storage.read().await.get(&dkey);
         if let Some(result) = local {
             return if self.verify_value(key, &result) { Some(result) } else { None };
         }
 
         let proto = self.protocol.as_ref()?;
 
-        let nearest: Vec<Node> = proto.router.lock().await.find_neighbors(&Node::from_id(dkey), None);
+        let nearest: Vec<Node> = proto.router.read().await.find_neighbors(&Node::from_id(dkey), None);
         if nearest.is_empty() {
             log::warn!("get({}): no known neighbours", key);
             return None;
@@ -296,7 +296,7 @@ impl Server {
             None => return false,
         };
         let node = Node::from_id(dkey);
-        let nearest = proto.router.lock().await.find_neighbors(&node, None);
+        let nearest = proto.router.read().await.find_neighbors(&node, None);
         if nearest.is_empty() {
             log::warn!("set_digest {}: no neighbours", hex::encode(dkey));
             return false;
@@ -317,7 +317,7 @@ impl Server {
         // Store locally if we are among the k-closest.
         if let Some(farthest) = nodes.iter().map(|n| n.distance_to(&node)).max() {
             if self.node.distance_to(&node) < farthest {
-                self.storage.lock().await.set(dkey.to_vec(), value.clone());
+                self.storage.write().await.set(dkey.to_vec(), value.clone());
             }
         }
 
@@ -343,7 +343,7 @@ impl Server {
             None => return false,
         };
         let node = Node::from_id(dkey);
-        let nearest = proto.router.lock().await.find_neighbors(&node, None);
+        let nearest = proto.router.read().await.find_neighbors(&node, None);
         if nearest.is_empty() {
             log::warn!("update_digest {}: no neighbours", key);
             return false;
@@ -361,7 +361,7 @@ impl Server {
 
         if let Some(farthest) = nodes.iter().map(|n| n.distance_to(&node)).max() {
             if self.node.distance_to(&node) < farthest {
-                self.storage.lock().await.set(dkey.to_vec(), value.clone());
+                self.storage.write().await.set(dkey.to_vec(), value.clone());
             }
         }
 
@@ -404,10 +404,10 @@ impl Server {
         // best-effort: in a 2-node case the remote peer may never have stored
         // the record locally (because it was farther from the key), so a
         // failing remote RPC must not count as a failed delete overall.
-        self.storage.lock().await.delete(&dkey);
+        self.storage.write().await.delete(&dkey);
 
         let node = Node::from_id(dkey);
-        let nearest = proto.router.lock().await.find_neighbors(&node, None);
+        let nearest = proto.router.read().await.find_neighbors(&node, None);
         if nearest.is_empty() {
             log::warn!("delete_digest {}: no neighbours, local delete only", hex::encode(dkey));
             return true;
@@ -460,7 +460,7 @@ impl Server {
         match &self.protocol {
             Some(proto) => proto
                 .router
-                .lock()
+                .read()
                 .await
                 .find_neighbors(&self.node, None)
                 .into_iter()
@@ -502,7 +502,7 @@ impl Server {
                     tokio::time::sleep(Duration::from_secs(frequency_secs)).await;
                     let neighbors: Vec<_> = proto
                         .router
-                        .lock()
+                        .read()
                         .await
                         .find_neighbors(&node, None)
                         .into_iter()
@@ -545,7 +545,7 @@ impl Server {
                 let mut futs = vec![];
                 for rid in refresh_ids {
                     let rnode = Node::from_id(rid);
-                    let neighbors = proto.router.lock().await.find_neighbors(&rnode, None);
+                    let neighbors = proto.router.read().await.find_neighbors(&rnode, None);
                     let spider = NodeSpiderCrawl::new(
                         Arc::clone(&proto),
                         rnode,
@@ -558,7 +558,7 @@ impl Server {
                 futures::future::join_all(futs).await;
 
                 // Republish keys older than one hour.
-                let old_entries = storage.lock().await.iter_older_than(3600);
+                let old_entries = storage.read().await.iter_older_than(3600);
                 for (key_vec, value) in old_entries {
                     if key_vec.len() != ID_LEN {
                         continue;
@@ -567,7 +567,7 @@ impl Server {
                     dkey.copy_from_slice(&key_vec);
                     let target = Node::from_id(dkey);
                     let neighbors =
-                        proto.router.lock().await.find_neighbors(&target, None);
+                        proto.router.read().await.find_neighbors(&target, None);
                     if neighbors.is_empty() {
                         continue;
                     }

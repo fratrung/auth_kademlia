@@ -1,4 +1,3 @@
-#![allow(non_local_definitions)]
 //! Python bindings for the AuthKademlia DHT server.
 //!
 //! Exposes the high-level [`Server`] struct as a Python class named `Server`
@@ -121,9 +120,9 @@ impl PyServer {
     ///
     /// Must be called before any other network operation.
     /// Raises ``RuntimeError`` on bind failure (e.g. port already in use).
-    fn listen<'py>(&self, py: Python<'py>, port: u16, host: String) -> PyResult<&'py PyAny> {
+    fn listen<'py>(&self, py: Python<'py>, port: u16, host: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
             inner
                 .write()
                 .await
@@ -146,9 +145,9 @@ impl PyServer {
         &self,
         py: Python<'py>,
         addrs: Vec<(String, u16)>,
-    ) -> PyResult<&'py PyAny> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let s = inner.read().await;
             let nodes = s.bootstrap(addrs).await;
             let peers: Vec<(String, u16)> =
@@ -164,9 +163,9 @@ impl PyServer {
     ///
     /// Returns:
     ///     bytes | None: Raw record bytes, or ``None`` if not found / invalid.
-    fn get<'py>(&self, py: Python<'py>, key: String) -> PyResult<&'py PyAny> {
+    fn get<'py>(&self, py: Python<'py>, key: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let s = inner.read().await;
             Ok(s.get(&key).await)
         })
@@ -183,9 +182,12 @@ impl PyServer {
     ///
     /// Returns:
     ///     bool | None: ``True`` on success, ``None`` if rejected.
-    fn set<'py>(&self, py: Python<'py>, key: String, value: Vec<u8>) -> PyResult<&'py PyAny> {
+    fn set<'py>(&self, py: Python<'py>, key: String, value: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // Read lock: Server::set takes &self and is internally thread-safe via
+            // the RwLock on ForgetfulStorage. The lock here only prevents concurrent
+            // listen/stop (write-lock) calls from racing with network operations.
             let s = inner.read().await;
             Ok(s.set(&key, value).await)
         })
@@ -209,9 +211,11 @@ impl PyServer {
         key: String,
         value: Vec<u8>,
         auth_signature: Option<Vec<u8>>,
-    ) -> PyResult<&'py PyAny> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // Read lock: same rationale as set — Server::update takes &self and
+            // delegates all storage mutations to the internal RwLock<ForgetfulStorage>.
             let s = inner.read().await;
             Ok(s.update(&key, value, auth_signature).await)
         })
@@ -231,9 +235,11 @@ impl PyServer {
         key: String,
         auth_signature: Vec<u8>,
         delete_msg: Vec<u8>,
-    ) -> PyResult<&'py PyAny> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // Read lock: same rationale as set — Server::delete takes &self and
+            // delegates all storage mutations to the internal RwLock<ForgetfulStorage>.
             let s = inner.read().await;
             Ok(s.delete(&key, auth_signature, delete_msg).await)
         })
@@ -243,9 +249,9 @@ impl PyServer {
     ///
     /// Notifies all known neighbours via Leave RPCs, then cancels background
     /// refresh and save tasks.
-    fn stop<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn stop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
             inner.write().await.stop().await;
             Ok(())
         })
@@ -255,9 +261,9 @@ impl PyServer {
     ///
     /// Returns:
     ///     list[tuple[str, int]]: Known peers as ``[(ip, port), …]``.
-    fn bootstrappable_neighbors<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn bootstrappable_neighbors<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let s = inner.read().await;
             Ok(s.bootstrappable_neighbors().await)
         })
@@ -266,9 +272,9 @@ impl PyServer {
     /// Save node state (ksize, alpha, ID, neighbours) to a JSON file.
     ///
     /// A no-op if the routing table is empty.
-    fn save_state<'py>(&self, py: Python<'py>, fname: String) -> PyResult<&'py PyAny> {
+    fn save_state<'py>(&self, py: Python<'py>, fname: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let s = inner.read().await;
             s.save_state(&fname).await;
             Ok(())
@@ -283,9 +289,9 @@ impl PyServer {
         py: Python<'py>,
         fname: String,
         frequency_secs: u64,
-    ) -> PyResult<&'py PyAny> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // Exclusive lock: save_state_regularly takes &mut self internally.
             inner.write().await.save_state_regularly(fname, frequency_secs);
             Ok(())
@@ -475,7 +481,7 @@ impl PyEd25519KeyManager {
 /// maturin is configured with ``module-name = "authkademlia_py"`` in
 /// ``pyproject.toml`` to produce the correctly-named ``.so`` file.
 #[pymodule]
-fn authkademlia_py(_py: Python, m: &PyModule) -> PyResult<()> {
+fn authkademlia_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyServer>()?;
     m.add_class::<PyDilithiumKeyManager>()?;
     m.add_class::<PyKyberKeyManager>()?;

@@ -117,8 +117,10 @@ All tests are network-clean (loopback only) and run in parallel without interfer
 | 15750 | invalid signature rejection |
 | 15760 | unreachable peer |
 | 15780–15781 | update rejected on invalid new-record self-signature |
+| 15782–15784 | update rejected when auth_sig uses wrong key |
+| 15785–15786 | delete rejected when signature uses wrong key |
 
-When adding a new integration test use ports **15782+** and document them here.
+When adding a new integration test use ports **15787+** and document them here.
 
 ## Docker
 ```

@@ -17,7 +17,7 @@ default = []
 # Build the Python extension module:
 #   maturin develop --features python
 #   maturin build   --features python
-python = ["dep:pyo3", "pyo3/extension-module", "dep:pyo3-asyncio"]
+python = ["dep:pyo3", "pyo3/extension-module", "dep:pyo3-async-runtimes"]
 
 [dependencies]
 # Async runtime
@@ -60,8 +60,8 @@ env_logger     = "0.11"
 
 # Python binding (optional — only compiled with --features python)
 # Use maturin for building the extension: `maturin build --features python`
-pyo3         = { version = "0.20", optional = true, features = ["extension-module"] }
-pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"], optional = true }
+pyo3                = { version = "0.21", optional = true, features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.21", features = ["tokio-runtime"], optional = true }
  
 
 

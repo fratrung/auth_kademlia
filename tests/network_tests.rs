@@ -32,9 +32,6 @@ use tokio::time::{sleep, Duration};
 
 use common::{build_did_document, build_signed_record, generate_did_iiot, start_node};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 1. Two-node bootstrap
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Two nodes bootstrap from each other and end up in each other's routing table.
 #[tokio::test]
@@ -58,9 +55,7 @@ async fn test_two_node_bootstrap_discover_each_other() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 2. Cross-node publish & retrieve
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 /// Node A stores a signed DID record; Node B retrieves it.
 /// This is the primary use case described in the README.
@@ -98,9 +93,7 @@ async fn test_set_on_node_a_and_get_from_node_b() {
     node_a.stop().await;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. Duplicate-key rejection
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 /// `set` on a key that already exists returns `None` (immutable records).
 #[tokio::test]
@@ -131,9 +124,7 @@ async fn test_set_duplicate_key_rejected() {
     node.stop().await;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 4. Key-rotation update
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 /// A DID owner rotates their key using the `update` operation:
 ///   1. Store old record (signed with old keypair).
@@ -143,8 +134,8 @@ async fn test_set_duplicate_key_rejected() {
 #[tokio::test]
 async fn test_update_did_record_key_rotation() {
     let mut node1 = start_node(15730).await;
-    let node2 = start_node(15731).await;
-    let node3 = start_node(15732).await;
+    let mut node2 = start_node(15731).await;
+    let mut node3 = start_node(15732).await;
 
     node2.bootstrap(vec![("127.0.0.1".to_string(), 15730)]).await;
     node3.bootstrap(vec![("127.0.0.1".to_string(), 15730)]).await;
@@ -179,23 +170,26 @@ async fn test_update_did_record_key_rotation() {
         "key-rotation update must succeed"
     );
 
-    // ── Step 5: subsequent get should return the NEW record ───────────────────
+    // ── Step 5: all nodes must return the NEW record ─────────────────────────
     // Give the network a moment to propagate the update.
-    sleep(Duration::from_millis(300)).await;
-    let retrieved = node1.get(&key).await;
-    assert!(retrieved.is_some(), "get after update must return the new record");
-    assert_eq!(
-        retrieved.unwrap(),
-        new_record,
-        "retrieved record must match the updated record"
-    );
+    sleep(Duration::from_millis(500)).await;
+
+    // node1 — neutral observer, verifies network-wide propagation.
+    let from_node1 = node1.get(&key).await;
+    assert!(from_node1.is_some(), "node1 must return the new record after update");
+    assert_eq!(from_node1.unwrap(), new_record, "node1: retrieved record must match the new record");
+
+    // node2 — original storing node; must no longer serve the old record.
+    let from_node2 = node2.get(&key).await;
+    assert!(from_node2.is_some(), "node2 must return the new record after update");
+    assert_eq!(from_node2.unwrap(), new_record, "node2: old record must be replaced by the new one");
 
     node1.stop().await;
+    node2.stop().await;
+    node3.stop().await;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 5. Authenticated delete
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 /// A DID owner deletes their record by signing a delete message with their key.
 /// After deletion, `get` returns None.
@@ -244,9 +238,6 @@ async fn test_delete_did_record() {
     node1.stop().await;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 6. Invalid-signature rejection
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// A record whose embedded signature does not match the public key in the
 /// DID Document must be rejected by `set` (returns None).
@@ -274,9 +265,7 @@ async fn test_invalid_signature_record_rejected_on_set() {
     node.stop().await;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 7. Bootstrap with no reachable peers
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 /// Bootstrapping against an address where no node is listening returns an
 /// empty discovered list gracefully (no panic, no hang).
@@ -295,9 +284,7 @@ async fn test_bootstrap_unreachable_peer_returns_empty() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 8. Update rejected when new record has invalid self-signature (port 15780)
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 /// `update` must return None when the submitted new record has a valid
 /// auth_signature (proving ownership of the old key) but an invalid
@@ -350,6 +337,108 @@ async fn test_update_rejected_when_new_record_self_sig_invalid() {
         "original record must remain after rejected update"
     );
     assert_eq!(still_there.unwrap(), old_record);
+
+    node1.stop().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. Update rejected when auth_sig uses a wrong key (port 15782–15784)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `update` must return None when the auth_signature is produced by a third
+/// party (not the old key owner), even if the new record carries a valid
+/// self-signature.  The original record must survive the failed attempt.
+///
+/// This exercises step 2 of `verify_key_rotation`: the auth_sig is checked
+/// against the OLD public key embedded in the stored record.
+#[tokio::test]
+async fn test_update_rejected_when_auth_signature_uses_wrong_key() {
+    let mut node1 = start_node(15782).await;
+    let node2 = start_node(15783).await;
+    let mut node3 = start_node(15784).await;
+
+    node2.bootstrap(vec![("127.0.0.1".to_string(), 15782)]).await;
+    node3.bootstrap(vec![("127.0.0.1".to_string(), 15782)]).await;
+    sleep(Duration::from_millis(300)).await;
+
+    // Store valid original record.
+    let (old_pk, old_sk) = dilithium2::keypair();
+    let (kpk, _) = kyber512::keypair();
+    let did = generate_did_iiot();
+    let key = did.split(':').last().unwrap().to_string();
+    let old_doc = build_did_document(&did, &old_pk, &kpk);
+    let old_record = build_signed_record(&old_doc, &old_sk, "Dilithium-2");
+
+    let stored = node2.set(&key, old_record.clone()).await;
+    assert!(stored.unwrap_or(false), "initial store must succeed");
+
+    // Build a new record with a valid self-signature.
+    let (new_pk, new_sk) = dilithium2::keypair();
+    let (new_kpk, _) = kyber512::keypair();
+    let new_doc = build_did_document(&did, &new_pk, &new_kpk);
+    let new_record = build_signed_record(&new_doc, &new_sk, "Dilithium-2");
+
+    // auth_sig produced with an UNRELATED key — attacker does not own the old key.
+    let (_, unrelated_sk) = dilithium2::keypair();
+    let bad_auth_sig = dilithium2::detached_sign(&new_record, &unrelated_sk)
+        .as_bytes()
+        .to_vec();
+
+    // Update via node3 must be rejected.
+    let result = node3.update(&key, new_record, Some(bad_auth_sig)).await;
+    assert!(result.is_none(), "update with wrong auth_sig must return None");
+
+    // Original record must still be retrievable from a neutral node.
+    sleep(Duration::from_millis(200)).await;
+    let still_there = node1.get(&key).await;
+    assert!(still_there.is_some(), "original record must survive a rejected update");
+    assert_eq!(still_there.unwrap(), old_record, "record content must be unchanged");
+
+    node1.stop().await;
+    node3.stop().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. Delete rejected when signature uses a wrong key (port 15785–15786)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `delete` must return None when the auth_signature is not produced by the
+/// record owner.  The record must remain in the DHT after the failed attempt.
+#[tokio::test]
+async fn test_delete_rejected_when_signature_uses_wrong_key() {
+    let mut node1 = start_node(15785).await;
+    let node2 = start_node(15786).await;
+
+    node2.bootstrap(vec![("127.0.0.1".to_string(), 15785)]).await;
+    sleep(Duration::from_millis(200)).await;
+
+    // Store a valid record on node1.
+    let (pk, sk) = dilithium2::keypair();
+    let (kpk, _) = kyber512::keypair();
+    let did = generate_did_iiot();
+    let key = did.split(':').last().unwrap().to_string();
+    let doc = build_did_document(&did, &pk, &kpk);
+    let record = build_signed_record(&doc, &sk, "Dilithium-2");
+
+    let stored = node1.set(&key, record.clone()).await;
+    assert!(stored.unwrap_or(false), "store must succeed");
+    sleep(Duration::from_millis(200)).await;
+
+    // Attempt delete with an UNRELATED key — not the record owner.
+    let (_, unrelated_sk) = dilithium2::keypair();
+    let delete_msg = b"DELETE THIS DID RECORD";
+    let bad_sig = dilithium2::detached_sign(delete_msg, &unrelated_sk)
+        .as_bytes()
+        .to_vec();
+
+    let result = node2.delete(&key, bad_sig, delete_msg.to_vec()).await;
+    assert!(result.is_none(), "delete with wrong key must return None");
+
+    // Record must still be retrievable after the rejected delete.
+    sleep(Duration::from_millis(200)).await;
+    let still_there = node1.get(&key).await;
+    assert!(still_there.is_some(), "record must survive a rejected delete");
+    assert_eq!(still_there.unwrap(), record, "record content must be unchanged");
 
     node1.stop().await;
 }

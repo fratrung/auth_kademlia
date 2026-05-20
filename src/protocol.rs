@@ -11,12 +11,13 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use log;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio::time::timeout;
 
 use crate::auth_handler::SignatureVerifierHandler;
@@ -26,6 +27,7 @@ use crate::routing::RoutingTable;
 use crate::storage::{ForgetfulStorage, IStorage};
 use crate::utils::{digest, ID_LEN};
 use crate::fragmentation::{MAX_MESSAGE_SIZE, FRAG_CHUNK_SIZE, REASSEMBLY_TTL, ReassemblyEntry, ReassemblyMap, encode_fragments, parse_fragment};
+
 
 /// Timeout for a single RPC call.
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -128,14 +130,14 @@ type PendingMap = Arc<Mutex<HashMap<u32, oneshot::Sender<RpcMessage>>>>;
 
 
 pub struct KademliaProtocol {
-    pub router: Arc<Mutex<RoutingTable>>,
-    pub storage: Arc<Mutex<ForgetfulStorage>>,
+    pub router: Arc<RwLock<RoutingTable>>,
+    pub storage: Arc<RwLock<ForgetfulStorage>>,
     pub source_node: Node,
     pub socket: Arc<UdpSocket>,
     pub signature_handler: Arc<dyn SignatureVerifierHandler>,
     pending: PendingMap,
-    next_msg_id: Arc<Mutex<u32>>,
-    next_frag_id: Arc<Mutex<u32>>,
+    next_msg_id: AtomicU32,
+    next_frag_id: AtomicU32,
     reassembly: ReassemblyMap,
 }
 
@@ -143,36 +145,30 @@ impl KademliaProtocol {
     pub fn new(
         source_node: Node,
         socket: Arc<UdpSocket>,
-        storage: Arc<Mutex<ForgetfulStorage>>,
+        storage: Arc<RwLock<ForgetfulStorage>>,
         ksize: usize,
         signature_handler: Arc<dyn SignatureVerifierHandler>,
     ) -> Self {
         let router = RoutingTable::new(source_node.clone(), ksize);
         Self {
-            router: Arc::new(Mutex::new(router)),
+            router: Arc::new(RwLock::new(router)),
             storage,
             source_node,
             socket,
             signature_handler,
             pending: Arc::new(Mutex::new(HashMap::new())),
-            next_msg_id: Arc::new(Mutex::new(0)),
-            next_frag_id: Arc::new(Mutex::new(0)),
+            next_msg_id: AtomicU32::new(0),
+            next_frag_id: AtomicU32::new(0),
             reassembly: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    async fn next_id(&self) -> u32 {
-        let mut id = self.next_msg_id.lock().await;
-        let out = *id;
-        *id = id.wrapping_add(1);
-        out
+    fn next_id(&self) -> u32 {
+        self.next_msg_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    async fn next_frag_id(&self) -> u32 {
-        let mut id = self.next_frag_id.lock().await;
-        let out = *id;
-        *id = id.wrapping_add(1);
-        out
+    fn next_frag_id_val(&self) -> u32 {
+        self.next_frag_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Drop reassembly buffers older than `REASSEMBLY_TTL`. Called opportunistically
@@ -203,7 +199,7 @@ impl KademliaProtocol {
             return false;
         }
 
-        let frag_id = self.next_frag_id().await;
+        let frag_id = self.next_frag_id_val();
         let datagrams = encode_fragments(frag_id, &bytes);
 
         if datagrams.len() > 1 {
@@ -227,7 +223,7 @@ impl KademliaProtocol {
 
     /// Send an RPC request to `addr` and wait for the matching response.
     async fn call(&self, addr: SocketAddr, message: RpcMessage) -> Option<RpcMessage> {
-        let msg_id = self.next_id().await;
+        let msg_id = self.next_id();
         let frame = Frame { msg_id, is_request: true, message };
 
         let (tx, rx) = oneshot::channel();
@@ -431,7 +427,7 @@ impl KademliaProtocol {
         key: [u8; ID_LEN],
         value: Vec<u8>,
     ) -> bool {
-        if self.storage.lock().await.get(&key).is_some() {
+        if self.storage.read().await.get(&key).is_some() {
             log::error!("rpc_store: record {} already exists", hex::encode(key));
             return false;
         }
@@ -441,7 +437,7 @@ impl KademliaProtocol {
         }
         let source = Node::new(sender_id, Some(sender_addr.0), Some(sender_addr.1));
         self.welcome_if_new(source).await;
-        self.storage.lock().await.set(key.to_vec(), value);
+        self.storage.write().await.set(key.to_vec(), value);
         true
     }
 
@@ -453,7 +449,7 @@ impl KademliaProtocol {
         value: Vec<u8>,
         auth_signature: Vec<u8>,
     ) -> bool {
-        let old_value = match self.storage.lock().await.get(&key) {
+        let old_value = match self.storage.read().await.get(&key) {
             Some(v) => v,
             None => {
                 log::error!("rpc_update: record {} not found", hex::encode(key));
@@ -470,7 +466,7 @@ impl KademliaProtocol {
         }
         let source = Node::new(sender_id, Some(sender_addr.0), Some(sender_addr.1));
         self.welcome_if_new(source).await;
-        self.storage.lock().await.set(key.to_vec(), value);
+        self.storage.write().await.set(key.to_vec(), value);
         true
     }
 
@@ -481,7 +477,7 @@ impl KademliaProtocol {
         key: [u8; ID_LEN],
         value: Vec<u8>,
     ) -> bool {
-        if self.storage.lock().await.get(&key).is_none() {
+        if self.storage.read().await.get(&key).is_none() {
             log::error!("rpc_update_status_list: record {} not found", hex::encode(key));
             return false;
         }
@@ -495,7 +491,7 @@ impl KademliaProtocol {
         }
         let source = Node::new(sender_id, Some(sender_addr.0), Some(sender_addr.1));
         self.welcome_if_new(source).await;
-        self.storage.lock().await.set(key.to_vec(), value);
+        self.storage.write().await.set(key.to_vec(), value);
         true
     }
 
@@ -507,7 +503,7 @@ impl KademliaProtocol {
         auth_signature: Vec<u8>,
         delete_msg: Vec<u8>,
     ) -> bool {
-        let value = match self.storage.lock().await.get(&key) {
+        let value = match self.storage.read().await.get(&key) {
             Some(v) => v,
             None => {
                 log::error!("rpc_delete: record {} not found", hex::encode(key));
@@ -524,7 +520,7 @@ impl KademliaProtocol {
         }
         let source = Node::new(sender_id, Some(sender_addr.0), Some(sender_addr.1));
         self.welcome_if_new(source).await;
-        self.storage.lock().await.delete(&key);
+        self.storage.write().await.delete(&key);
         true
     }
 
@@ -537,7 +533,7 @@ impl KademliaProtocol {
         let source = Node::new(sender_id, Some(sender_addr.0.clone()), Some(sender_addr.1));
         self.welcome_if_new(source.clone()).await;
         let target = Node::from_id(key);
-        self.router.lock().await.find_neighbors(&target, Some(&source))
+        self.router.read().await.find_neighbors(&target, Some(&source))
     }
 
     pub async fn rpc_find_value(
@@ -548,7 +544,7 @@ impl KademliaProtocol {
     ) -> FindValueResult {
         let source = Node::new(sender_id, Some(sender_addr.0.clone()), Some(sender_addr.1));
         self.welcome_if_new(source.clone()).await;
-        match self.storage.lock().await.get(&key) {
+        match self.storage.read().await.get(&key) {
             Some(v) => FindValueResult::Value(v),
             None => {
                 let neighbors = self.rpc_find_node(sender_id, sender_addr, key).await;
@@ -560,7 +556,7 @@ impl KademliaProtocol {
     pub async fn rpc_leave(&self, sender_id: [u8; ID_LEN], sender_addr: (String, u16)) {
         log::info!("Node {} is leaving the network", hex::encode(sender_id));
         let source = Node::new(sender_id, Some(sender_addr.0), Some(sender_addr.1));
-        self.router.lock().await.remove_contact(&source);
+        self.router.write().await.remove_contact(&source);
     }
 
 
@@ -716,17 +712,17 @@ impl KademliaProtocol {
     /// If `node` is new, add it to the routing table and replicate relevant
     /// keys to it (Kademlia §2.5 — new node integration).
     pub async fn welcome_if_new(&self, node: Node) {
-        if !self.router.lock().await.is_new_node(&node) {
+        if !self.router.read().await.is_new_node(&node) {
             return;
         }
         log::info!("New node discovered: {}", node);
 
-        let all_entries = self.storage.lock().await.iter_all();
+        let all_entries = self.storage.read().await.iter_all();
         let self_node = self.source_node.clone();
         let node_clone = node.clone();
 
         let keys_to_replicate: Vec<([u8; ID_LEN], Vec<u8>)> = {
-            let router = self.router.lock().await;
+            let router = self.router.read().await;
             all_entries
                 .into_iter()
                 .filter_map(|(key_vec, value)| {
@@ -753,7 +749,7 @@ impl KademliaProtocol {
                 .collect()
         };
 
-        self.router.lock().await.add_contact(node.clone());
+        self.router.write().await.add_contact(node.clone());
 
         // Send store RPCs for keys the new node should hold.
         for (key, value) in keys_to_replicate {
@@ -765,7 +761,7 @@ impl KademliaProtocol {
     pub async fn get_refresh_ids(&self) -> Vec<[u8; ID_LEN]> {
         use rand::RngCore;
         self.router
-            .lock()
+            .read()
             .await
             .lonely_buckets()
             .iter()

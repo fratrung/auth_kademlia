@@ -165,19 +165,17 @@ impl DIDSignatureVerifierHandler {
         old_value: &[u8],
         auth_signature: &[u8],
     ) -> Result<bool, AuthHandlerError> {
-        // Step 1: extract old public key.
         let old_alg = get_alg_string(old_value)?;
         let (_, old_sig_len) = resolve_alg_and_length(&old_alg)?;
         let (_, old_data) = extract_sig_and_data(old_value, old_sig_len)?;
         let old_pub_key = public_key_from_did_doc(old_data)?;
 
-        // Step 2: auth_signature(new_value) must verify under old key.
         let verifier = SignatureVerifierFactory::get_verifier(&old_alg)?;
         if !verifier.verify(&old_pub_key, auth_signature, new_value)? {
             return Ok(false);
         }
 
-        // Step 3: new_value must be internally consistent.
+        
         self.verify_self_signed(new_value)
     }
 }

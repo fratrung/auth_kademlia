@@ -27,7 +27,6 @@ use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-// ─── helpers ────────────────────────────────────────────────────────────────
 
 fn base64url_encode(pk: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(pk)
