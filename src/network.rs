@@ -339,7 +339,7 @@ impl Server {
         let node = Node::from_id(dkey);
         let nearest = proto.router.read().await.find_neighbors(&node, None);
         if nearest.is_empty() {
-            log::warn!("set_digest {}: no neighbours", hex::encode(dkey));
+            log::warn!("set_digest {}: routing table empty — no neighbours", hex::encode(dkey));
             return false;
         }
 
@@ -353,8 +353,16 @@ impl Server {
         .find()
         .await;
 
+        if nodes.is_empty() {
+            log::warn!(
+                "set_digest {}: spider crawl returned 0 nodes (routing degraded)",
+                hex::encode(dkey)
+            );
+            return false;
+        }
+
         log::info!(
-            "set_digest {}: storing on {} nodes",
+            "set_digest {}: spider found {} nodes, issuing store RPCs",
             hex::encode(dkey),
             nodes.len()
         );
@@ -372,7 +380,18 @@ impl Server {
             let v = value.clone();
             futs.push(async move { p.call_store_rpc(&n, dkey, v).await });
         }
-        futures::future::join_all(futs).await.iter().any(|&r| r)
+        let results = futures::future::join_all(futs).await;
+        let ok_count = results.iter().filter(|&&r| r).count();
+        if ok_count == 0 {
+            log::warn!(
+                "set_digest {}: all {} call_store_rpc returned false (nodes unreachable or rejected)",
+                hex::encode(dkey),
+                results.len()
+            );
+        } else {
+            log::info!("set_digest {}: {}/{} nodes acknowledged store", hex::encode(dkey), ok_count, results.len());
+        }
+        ok_count > 0
     }
 
     async fn update_digest(
@@ -481,11 +500,28 @@ impl Server {
 
     fn verify_value(&self, key: &str, value: &[u8]) -> bool {
         if let Some(cache) = &self.sig_cache {
-            if let Some(cached) = cache.get(value) {
+            let cache_key = SignatureCache::compute_key(value);
+            if let Some(cached) = cache.get_by_key(&cache_key) {
                 return cached;
             }
+            let result = if key == STATUS_LIST_KEY {
+                let ok = self
+                    .signature_handler
+                    .handle_issuer_node_signature_verification(value)
+                    .unwrap_or(false);
+                if ok {
+                    log::info!("Status-list signature verified");
+                }
+                ok
+            } else {
+                self.signature_handler
+                    .handle_signature_verification(value)
+                    .unwrap_or(false)
+            };
+            cache.insert_by_key(cache_key, result);
+            return result;
         }
-        let result = if key == STATUS_LIST_KEY {
+        if key == STATUS_LIST_KEY {
             let ok = self
                 .signature_handler
                 .handle_issuer_node_signature_verification(value)
@@ -498,11 +534,7 @@ impl Server {
             self.signature_handler
                 .handle_signature_verification(value)
                 .unwrap_or(false)
-        };
-        if let Some(cache) = &self.sig_cache {
-            cache.insert(value, result);
         }
-        result
     }
 
     /// Return the addresses of bootstrappable neighbour nodes.

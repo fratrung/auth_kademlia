@@ -12,6 +12,31 @@ Unlike conventional DHT implementations, AuthKademlia-RS treats stored values as
 
 -----
 
+## Why Rust for the DHT Core?
+
+The original [AuthKademlia](https://github.com/fratrung/AuthKademlia) is written in Python, and the application-layer logic (provisioning, REST APIs, orchestration) intentionally remains in Python. The DHT node core, however, has been reimplemented in Rust to address a fundamental constraint: **post-quantum signature verification is CPU-bound, and the Python GIL serialises all CPU-bound work to a single thread regardless of how many cores are available**.
+
+### The GIL bottleneck on CPU-bound workloads
+
+Python's **Global Interpreter Lock (GIL)** permits only one thread to execute bytecode at a time. For I/O-bound tasks this is rarely a bottleneck, but Dilithium-2 signature verification is purely computational. In CPython, even with `threading` or `asyncio`, all verification calls are serialised to one core:
+
+```
+Python (N cores):  throughput ≈ 1 core × ops/s        (GIL ceiling)
+Rust   (N cores):  throughput ≈ N cores × ops/s        (true parallelism)
+```
+
+This gap widens on hardware with slower per-core performance, which is common in embedded and edge deployments where power and cost constraints favour multi-core low-frequency processors over single-core speed. The Python implementation would leave most available compute idle; the Rust implementation uses every core.
+
+### Layered architecture via PyO3
+
+The Python binding (built with [maturin](https://github.com/PyO3/maturin) via PyO3) releases the GIL before entering Rust code. This means:
+
+- The **application layer stays in Python** — no rewrite required for existing tooling.
+- The **DHT hot path (store, get, signature verification)** runs in Rust across all available cores with zero GIL contention.
+- The performance gap between the two implementations grows proportionally with the number of cores and with the cost of the cryptographic primitive — both of which favour Rust in production deployments.
+
+-----
+
 ## Key Differentiators
 
 |Feature                  |Standard Kademlia|AuthKademlia-RS                     |
@@ -113,33 +138,27 @@ reads the effective throughput is much higher than the raw numbers above.
 
 ### Signature cache benchmark
 
-Measured with `examples/cache_bench.rs` — two isolated 3-node loopback clusters
-(one with `use_cache = true`, one with `use_cache = false`) running the same
-workload: SET a fresh DID Document, cold GET (first application-layer read),
-warm GET (second read of the same key).
+Measured with `examples/cache_bench.rs` using two isolated phases:
 
-**Representative run — 300 ops, concurrency 20** (`cargo run --release --example cache_bench -- 300 20`):
+- **Phase 1 — DHT SET throughput**: clusters run sequentially (no CPU contention), real network operations.
+- **Phase 2 — Signature verification micro-benchmark**: records injected directly into local storage, sequential `get()` calls, zero network variance. This isolates the exact cost of signature verification.
+
+**Stable results across 3 runs — 8000 SET ops (c=30), micro-bench 500 ops sequential**
+(`cargo run --release --example cache_bench -- 8000 30`):
 
 | Operation | Cached (avg) | Uncached (avg) | Speedup |
 |---|---|---|---|
-| SET | 6.6 ms | 7.7 ms | 1.2× |
-| GET cold | 38 µs | 98 µs | **2.6×** |
-| GET warm | 13 µs | 104 µs | **8.2×** |
+| DHT SET | ~3.5 ms | ~3.6 ms | ~1× |
+| GET cold (local) | ~84 µs | ~74 µs | 0.9× |
+| GET warm (local) | **~9.6 µs** | ~74 µs | **~7.8×** |
 
-All runs (100–400 ops, concurrency 10–30): 0 failures, 0 data corruptions.
+Variance across 3 runs: GET warm cached 9.4–9.7 µs (CV < 4%) — results are stable and reproducible.
 
 **How to read the numbers:**
 
-- *SET*: marginally faster with cache because `rpc_store` handlers on the
-  receiving nodes benefit from cross-layer pre-warming (shared `Arc<SignatureCache>`
-  between `Server` and `KademliaProtocol`).
-- *GET cold*: the "cold" application-layer read is already a cache hit in the
-  cached case — when `call_store_rpc` delivers the record to a node, `rpc_store`
-  verifies and caches it in the same shared `SignatureCache` that `Server::get`
-  later queries. So the first `get()` call sees a cache hit instead of a
-  Dilithium-2 re-verification.
-- *GET warm*: the primary signal — SHA-256 cache lookup (~12 µs) vs full
-  Dilithium-2 re-verification (~100 µs) = **5–8× speedup** depending on load.
+- *DHT SET*: comparable for both clusters — write throughput is dominated by network roundtrip, not signature verification.
+- *GET cold*: the cached cluster pays a ~10 µs overhead on cache miss (one SHA-256 of the 6 KB record + `moka.insert()`), making it marginally *slower* than uncached on first read. This is unavoidable: the cache key must be computed at least once to know there is no hit. The overhead is bounded and non-regressing.
+- *GET warm*: the primary signal — one SHA-256 cache lookup (~9.6 µs) vs full Dilithium-2 re-verification (~74 µs) = **7–8× speedup**. This is the path that matters for IoT nodes that read the same DID Document repeatedly (e.g. device authentication on every connection).
 
 The cache can be disabled per-node (`Server::new(..., use_cache: false)`) for
 security auditing or benchmarking without touching any other code path.

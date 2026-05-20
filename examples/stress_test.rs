@@ -244,7 +244,13 @@ async fn run_security_checks(nodes: &[Arc<Server>]) -> Vec<Check> {
         results.push(if ok {
             Check::pass("Valid record accepted", "set() returned Some(true)")
         } else {
-            Check::fail("Valid record accepted", format!("set() returned {r:?}"))
+            let diagnosis = match &r {
+                Err(_) => "timeout — node unreachable or overloaded",
+                Ok(None) => "None — signature invalid or key already exists (unexpected)",
+                Ok(Some(false)) => "Some(false) — spider crawl returned 0 reachable nodes (routing degraded); run with RUST_LOG=warn for details",
+                _ => "unexpected variant",
+            };
+            Check::fail("Valid record accepted", format!("set() returned {r:?} [{diagnosis}]"))
         });
     }
 
@@ -316,42 +322,53 @@ async fn run_security_checks(nodes: &[Arc<Server>]) -> Vec<Check> {
     {
         let (_did, key, record, _) = new_did();
         let first = timeout(OP_TIMEOUT, writer.set(&key, record.clone())).await;
-        assert!(
-            matches!(first, Ok(Some(true))),
-            "first insert should succeed"
-        );
 
-        // Build a second valid record for the same key (different owner keypair)
-        let (dpk2, dsk2) = dilithium2::keypair();
-        let (kpk2, _) = kyber512::keypair();
-        let did2 = format!("did:iiot:{}", key); // same UUID suffix → same DHT key
-        let doc2 = build_did_document(&did2, &dpk2, &kpk2);
-        let record2 = build_signed_record(&doc2, &dsk2);
-
-        let second = timeout(OP_TIMEOUT, writer.set(&key, record2)).await;
-        let ok = matches!(second, Ok(None));
-        results.push(if ok {
-            Check::pass("Duplicate key rejected", "second set() returned None (key already exists)")
-        } else {
-            Check::fail(
-                "Duplicate key rejected",
-                format!("expected None, got {second:?}  ← IMMUTABILITY VIOLATION"),
-            )
-        });
-
-        // Also verify the stored record is still the original (not overwritten)
-        let stored = timeout(OP_TIMEOUT, reader.get(&key)).await;
-        let original_intact = matches!(&stored, Ok(Some(v)) if v == &record);
-        if !original_intact {
+        if !matches!(first, Ok(Some(true))) {
+            let diagnosis = match &first {
+                Err(_) => "timeout",
+                Ok(None) => "None — signature invalid (bug in test setup)",
+                Ok(Some(false)) => "Some(false) — routing degraded, spider crawl found no reachable nodes",
+                _ => "unexpected",
+            };
             results.push(Check::fail(
-                "Duplicate key: original preserved",
-                format!("original record was overwritten or missing  ← DATA INTEGRITY FAILURE"),
+                "Duplicate key rejected",
+                format!("first insert failed [{diagnosis}]: {first:?}"),
             ));
         } else {
-            results.push(Check::pass(
-                "Duplicate key: original preserved",
-                "get() returned original record unchanged",
-            ));
+            // Build a second valid record for the same key (different owner keypair)
+            let (dpk2, dsk2) = dilithium2::keypair();
+            let (kpk2, _) = kyber512::keypair();
+            let did2 = format!("did:iiot:{}", key); // same UUID suffix → same DHT key
+            let doc2 = build_did_document(&did2, &dpk2, &kpk2);
+            let record2 = build_signed_record(&doc2, &dsk2);
+
+            let second = timeout(OP_TIMEOUT, writer.set(&key, record2)).await;
+            let ok = matches!(second, Ok(None));
+            results.push(if ok {
+                Check::pass("Duplicate key rejected", "second set() returned None (key already exists)")
+            } else {
+                Check::fail(
+                    "Duplicate key rejected",
+                    format!("expected None, got {second:?}  ← IMMUTABILITY VIOLATION"),
+                )
+            });
+
+            // Also verify the stored record is still the original (not overwritten)
+            let stored = timeout(OP_TIMEOUT, reader.get(&key)).await;
+            let original_intact = matches!(&stored, Ok(Some(v)) if v == &record);
+            results.push(if original_intact {
+                Check::pass("Duplicate key: original preserved", "get() returned original record unchanged")
+            } else {
+                let diagnosis = match &stored {
+                    Err(_) => "timeout — reader node unreachable",
+                    Ok(None) => "None — record not found (routing degraded, not overwritten)",
+                    Ok(Some(_)) => "Some(wrong_bytes) — record bytes differ (actual integrity failure)",
+                };
+                Check::fail(
+                    "Duplicate key: original preserved",
+                    format!("stored={stored:?} [{diagnosis}]"),
+                )
+            });
         }
     }
 
@@ -569,10 +586,27 @@ async fn main() {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Phase 2: Security invariants
+    // Phase 2: Security invariants — isolated cluster
     // ─────────────────────────────────────────────────────────────────────────
-    println!("\n━━━ Phase 2: Security Invariants ━━━━━━━━━━━━━━━\n");
-    let checks = run_security_checks(&nodes).await;
+    // Phase 1 degrades the routing tables of the stress cluster: at high
+    // concurrency (c > 50), RPC timeouts trigger remove_contact, leaving
+    // nodes unable to find each other. Running security checks on the same
+    // stressed nodes would produce spurious availability failures (Some(false),
+    // get→None) that are unrelated to the security properties under test.
+    //
+    // Solution: fresh cluster on separate ports, bootstrapped from scratch.
+    println!("\n  Spinning up isolated security cluster...");
+    const SEC_SEED_PORT: u16 = 15803;
+    const SEC_PEER1_PORT: u16 = 15804;
+    let sec_seed = start_node(SEC_SEED_PORT).await;
+    let sec_peer = start_node(SEC_PEER1_PORT).await;
+    sec_peer.bootstrap(vec![("127.0.0.1".to_string(), SEC_SEED_PORT)]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let sec_nodes: Vec<Arc<Server>> = vec![sec_seed, sec_peer];
+    println!("  ok\n");
+
+    println!("━━━ Phase 2: Security Invariants ━━━━━━━━━━━━━━━\n");
+    let checks = run_security_checks(&sec_nodes).await;
     let total = checks.len();
     let passed = checks.iter().filter(|c| c.passed).count();
 

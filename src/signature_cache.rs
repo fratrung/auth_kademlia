@@ -21,17 +21,32 @@ impl SignatureCache {
         Self { cache }
     }
 
-    fn cache_key(value: &[u8]) -> [u8; 32] {
+    /// Compute the cache key for `value` — SHA-256 of the full record bytes.
+    /// Callers that need to both look up and insert should call this once and
+    /// use `get_by_key` / `insert_by_key` to avoid hashing twice.
+    pub fn compute_key(value: &[u8]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(value);
         hasher.finalize().into()
     }
 
-    pub fn get(&self, value: &[u8]) -> Option<bool> {
-        self.cache.get(&Self::cache_key(value))
+    pub fn get_by_key(&self, key: &[u8; 32]) -> Option<bool> {
+        self.cache.get(key)
     }
 
+    pub fn insert_by_key(&self, key: [u8; 32], result: bool) {
+        self.cache.insert(key, result);
+    }
+
+    /// Convenience wrapper — computes the key internally. Use when only
+    /// looking up (no subsequent insert in the same call site).
+    pub fn get(&self, value: &[u8]) -> Option<bool> {
+        self.cache.get(&Self::compute_key(value))
+    }
+
+    /// Convenience wrapper — computes the key internally. Use when only
+    /// inserting (no preceding get in the same call site).
     pub fn insert(&self, value: &[u8], result: bool) {
-        self.cache.insert(Self::cache_key(value), result);
+        self.cache.insert(Self::compute_key(value), result);
     }
 }

@@ -7,6 +7,13 @@ agreement). Nodes accept a record only if the embedded signature is valid;
 updates and deletes require a second auth-signature produced with the owner's
 private key.
 
+**Target platform**: edge/embedded nodes (ARM multi-core, low per-core frequency)
+for the `did:iiot` method. The Rust core is the performance-critical layer:
+Dilithium-2 verification is CPU-bound (~5 ms on x86) and Python's GIL would
+serialise it to a single core. The PyO3 binding releases the GIL before
+entering Rust so all available cores can verify signatures in parallel.
+Application-layer logic (provisioning, REST APIs, orchestration) remains in Python.
+
 ## Build & test
 ```
 cargo build                          # library + dht_node binary
@@ -86,7 +93,7 @@ All RPCs are serialised with `bincode` and framed with a `(msg_id: u32, is_reque
 - `rpc_store` uses `insert_if_absent` (DashMap `Entry` API) — atomic at shard level, closes the TOCTOU race between "does key exist?" and "write it".
 - All RPC handlers use `self: &Arc<Self>` receiver to enable `tokio::spawn` without cloning the full struct. `welcome_if_new` is always fire-and-forget.
 - UDP receive loop dispatches through `mpsc::channel(1024)` → 4 fixed workers. Backpressure is applied when the channel is full.
-- `SignatureCache` is keyed on `SHA-256(record_bytes)`. TTL 1 h, capacity 4096. Eviction = cache miss = full re-verification (never a security bypass).
+- `SignatureCache` is keyed on `SHA-256(record_bytes)`. TTL 1 h, capacity 4096 (moka TinyLFU). Eviction = cache miss = full re-verification (never a security bypass). On a cache miss the SHA-256 key is computed once via `compute_key()` and reused for both `get_by_key` and `insert_by_key` — never twice.
 - `welcome_if_new` replication uses two conditions (Kademlia §2.5, matches Python AuthKademlia): `new_node_close` (new node is XOR-closer than the farthest k-neighbor) AND `this_closest` (this node is closer than the nearest k-neighbor). Both must be true to replicate. Neighbors are computed before `add_contact` so the new node is excluded from comparisons.
 
 ## Key invariants

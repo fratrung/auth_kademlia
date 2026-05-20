@@ -806,13 +806,25 @@ impl KademliaProtocol {
     /// Verify `value` for `key`, using the signature cache to skip redundant
     /// PQ crypto on repeated calls with the same record bytes.
     fn verify_for_key(&self, key: &[u8; ID_LEN], value: &[u8]) -> bool {
+        let status_list_key = digest(STATUS_LIST_KEY);
         if let Some(cache) = &self.sig_cache {
-            if let Some(cached) = cache.get(value) {
+            let cache_key = SignatureCache::compute_key(value);
+            if let Some(cached) = cache.get_by_key(&cache_key) {
                 return cached;
             }
+            let result = if *key == status_list_key {
+                self.signature_handler
+                    .handle_issuer_node_signature_verification(value)
+                    .unwrap_or(false)
+            } else {
+                self.signature_handler
+                    .handle_signature_verification(value)
+                    .unwrap_or(false)
+            };
+            cache.insert_by_key(cache_key, result);
+            return result;
         }
-        let status_list_key = digest(STATUS_LIST_KEY);
-        let result = if *key == status_list_key {
+        if *key == status_list_key {
             self.signature_handler
                 .handle_issuer_node_signature_verification(value)
                 .unwrap_or(false)
@@ -820,11 +832,7 @@ impl KademliaProtocol {
             self.signature_handler
                 .handle_signature_verification(value)
                 .unwrap_or(false)
-        };
-        if let Some(cache) = &self.sig_cache {
-            cache.insert(value, result);
         }
-        result
     }
 
     /// If `node` is new, add it to the routing table and replicate relevant

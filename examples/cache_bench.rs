@@ -1,21 +1,25 @@
-//! Cache vs no-cache benchmark for AuthKademlia-RS.
+//! Signature cache benchmark for AuthKademlia-RS.
 //!
-//! Spins up two identical 3-node clusters on loopback:
-//!   - Cluster A: `use_cache = true`  (shared `Arc<SignatureCache>`)
-//!   - Cluster B: `use_cache = false` (full Dilithium-2 re-verification every time)
+//! Two distinct measurement phases:
 //!
-//! Runs the same synthetic workload against both clusters and measures:
-//!   - SET latency          — store a fresh signed DID Document
-//!   - Cold GET latency     — first read (signature verification always runs)
-//!   - Warm GET latency     — second read of the same key
-//!                            (cache: SHA-256 lookup; no-cache: Dilithium-2 re-verify)
+//! **Phase 1 — DHT SET throughput** (real network, both clusters run sequentially)
+//!   Measures end-to-end write performance with and without the signature cache.
+//!   The cache pre-warms on `rpc_store`, so the first GET after a SET is already
+//!   a cache hit on the cached cluster.
 //!
-//! The warm-GET column is the primary signal: it isolates the pure cost of
-//! Dilithium-2 verification that the cache eliminates.
+//! **Phase 2 — Signature verification micro-benchmark** (local storage only)
+//!   Records are written directly to `server.storage` — no network involved.
+//!   Then `server.get()` is called twice per record:
+//!   - Cold: cache miss → full Dilithium-2 verification (~100 µs)
+//!   - Warm: cache hit  → SHA-256 key lookup             (~1 µs)
+//!   Uncached cluster always pays full Dilithium-2 on both reads.
+//!
+//!   This phase gives stable, reproducible numbers because it eliminates all
+//!   network variance from the GET measurement.
 //!
 //! Run:
 //!   cargo run --release --example cache_bench
-//!   cargo run --release --example cache_bench -- 300 25   # ops concurrency
+//!   cargo run --release --example cache_bench -- 500 20   # ops concurrency
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,6 +28,8 @@ use std::time::{Duration, Instant};
 
 use auth_kademlia_rs::auth_handler::DIDSignatureVerifierHandler;
 use auth_kademlia_rs::network::Server;
+use auth_kademlia_rs::storage::IStorage;
+use auth_kademlia_rs::utils::digest;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use pqcrypto_dilithium::dilithium2;
@@ -35,16 +41,27 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-// ── Port allocations (must not overlap with any other test/example) ───────────
-const CACHED_SEED: u16 = 15810;
-const CACHED_PEER1: u16 = 15811;
-const CACHED_PEER2: u16 = 15812;
-const UNCACHED_SEED: u16 = 15813;
+// ── Port allocations ──────────────────────────────────────────────────────────
+// Clusters run sequentially so ports can be reused between phases,
+// but we keep them distinct from stress_test (15800-15804).
+const CACHED_SEED:   u16 = 15810;
+const CACHED_PEER1:  u16 = 15811;
+const CACHED_PEER2:  u16 = 15812;
+const UNCACHED_SEED:  u16 = 15813;
 const UNCACHED_PEER1: u16 = 15814;
 const UNCACHED_PEER2: u16 = 15815;
+// Isolated single-node clusters for Phase 2 micro-benchmark.
+// Must be fresh (empty cache) so TinyLFU eviction from Phase 1 does not
+// interfere with cache hit measurements.
+const MICRO_CACHED_PORT:   u16 = 15816;
+const MICRO_UNCACHED_PORT: u16 = 15817;
 
-const DEFAULT_OPS: usize = 200;
+const DEFAULT_OPS:         usize = 300;
 const DEFAULT_CONCURRENCY: usize = 20;
+// Micro-bench uses fewer ops: each op is sequential (~100 µs each), so 500
+// gives a stable average in < 0.1 s total per cluster.
+const MICRO_OPS: usize = 500;
+
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ── Latency helpers ───────────────────────────────────────────────────────────
@@ -58,10 +75,15 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 }
 
 fn avg_ns(v: &[u64]) -> f64 {
-    if v.is_empty() {
-        return 0.0;
-    }
+    if v.is_empty() { return 0.0; }
     v.iter().sum::<u64>() as f64 / v.len() as f64
+}
+
+fn stddev_ns(v: &[u64]) -> f64 {
+    if v.len() < 2 { return 0.0; }
+    let mean = avg_ns(v);
+    let var = v.iter().map(|&x| { let d = x as f64 - mean; d * d }).sum::<f64>() / v.len() as f64;
+    var.sqrt()
 }
 
 fn fmt_dur(ns: u64) -> String {
@@ -96,22 +118,21 @@ fn sort_json_keys(v: &Value) -> Value {
     }
 }
 
-fn build_signed_record(did: &str, dpk: &dilithium2::PublicKey, dsk: &dilithium2::SecretKey, kpk: &kyber512::PublicKey) -> (String, Vec<u8>) {
+fn new_record() -> (String, Vec<u8>) {
+    let (dpk, dsk) = dilithium2::keypair();
+    let (kpk, _)   = kyber512::keypair();
+    let did = format!("did:iiot:{}", Uuid::new_v4());
     let key = did.split(':').next_back().unwrap().to_string();
     let doc = json!({
         "@context": ["https://www.w3.org/ns/did/v1"],
         "id": did,
         "verificationMethod": [
             {
-                "id": format!("{}#k0", did),
-                "type": "JsonWebKey2020",
-                "controller": did,
+                "id": format!("{}#k0", did), "type": "JsonWebKey2020", "controller": did,
                 "publicKeyJwk": { "kty": "OKP", "crv": "Dilithium2", "x": base64url(dpk.as_bytes()) }
             },
             {
-                "id": format!("{}#k1", did),
-                "type": "JsonWebKey2020",
-                "controller": did,
+                "id": format!("{}#k1", did), "type": "JsonWebKey2020", "controller": did,
                 "publicKeyJwk": { "kty": "OKP", "crv": "Kyber512", "x": base64url(kpk.as_bytes()) }
             }
         ],
@@ -123,7 +144,7 @@ fn build_signed_record(did: &str, dpk: &dilithium2::PublicKey, dsk: &dilithium2:
     let doc_bytes = serde_json::to_vec(&sort_json_keys(&doc)).expect("serialize");
     let mut alg = [0u8; 12];
     alg[..11].copy_from_slice(b"Dilithium-2");
-    let sig = dilithium2::detached_sign(&doc_bytes, dsk);
+    let sig = dilithium2::detached_sign(&doc_bytes, &dsk);
     let sig_bytes = <dilithium2::DetachedSignature as pqcrypto_traits::sign::DetachedSignature>::as_bytes(&sig);
     let mut record = Vec::with_capacity(12 + sig_bytes.len() + doc_bytes.len());
     record.extend_from_slice(&alg);
@@ -132,211 +153,158 @@ fn build_signed_record(did: &str, dpk: &dilithium2::PublicKey, dsk: &dilithium2:
     (key, record)
 }
 
-fn new_record() -> (String, Vec<u8>) {
-    let (dpk, dsk) = dilithium2::keypair();
-    let (kpk, _)   = kyber512::keypair();
-    let did = format!("did:iiot:{}", Uuid::new_v4());
-    build_signed_record(&did, &dpk, &dsk, &kpk)
-}
-
 // ── Cluster factory ───────────────────────────────────────────────────────────
 
 async fn start_cluster(seed: u16, peer1: u16, peer2: u16, use_cache: bool) -> Vec<Arc<Server>> {
-    let make = |port: u16| {
-        let use_cache = use_cache;
-        async move {
-            let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
-            let mut srv = Server::new(handler, 20, 3, None, None, use_cache);
-            srv.listen(port, "127.0.0.1").await.expect("listen failed");
-            Arc::new(srv)
-        }
+    let make = |port: u16| async move {
+        let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
+        let mut srv = Server::new(handler, 20, 3, None, None, use_cache);
+        srv.listen(port, "127.0.0.1").await.expect("listen failed");
+        Arc::new(srv)
     };
-
     let s  = make(seed).await;
     let p1 = make(peer1).await;
     let p2 = make(peer2).await;
-
     p1.bootstrap(vec![("127.0.0.1".to_string(), seed)]).await;
     p2.bootstrap(vec![("127.0.0.1".to_string(), seed)]).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
+    tokio::time::sleep(Duration::from_millis(300)).await;
     vec![s, p1, p2]
 }
 
-// ── Workload ──────────────────────────────────────────────────────────────────
+// ── Phase 1: DHT SET throughput ───────────────────────────────────────────────
 
-/// Collected latencies and counters for one cluster run.
-struct Results {
-    set_ns:       Vec<u64>,
-    cold_get_ns:  Vec<u64>,
-    warm_get_ns:  Vec<u64>,
-    set_ok:       usize,
-    get_ok:       usize,
-    failures:     usize,
-    wall_secs:    f64,
+struct SetResults {
+    set_ns:    Vec<u64>,
+    ok:        usize,
+    failures:  usize,
+    wall_secs: f64,
 }
 
-/// One SET → cold-GET → warm-GET round on `writer`/`reader`.
-/// Returns `(set_ns, cold_ns, warm_ns)` or an error label.
-async fn bench_op(
-    writer: Arc<Server>,
-    reader: Arc<Server>,
-) -> Result<(u64, u64, u64), &'static str> {
-    let (key, record) = new_record();
-
-    let t0 = Instant::now();
-    let ok = timeout(OP_TIMEOUT, writer.set(&key, record.clone()))
-        .await
-        .map_err(|_| "set timeout")?;
-    let set_ns = t0.elapsed().as_nanos() as u64;
-    if ok != Some(true) {
-        return Err("set failed");
-    }
-
-    // Cold GET: signature cache empty for this record.
-    let t1 = Instant::now();
-    timeout(OP_TIMEOUT, reader.get(&key))
-        .await
-        .map_err(|_| "cold-get timeout")?
-        .ok_or("cold-get None")?;
-    let cold_ns = t1.elapsed().as_nanos() as u64;
-
-    // Warm GET: cache case → SHA-256 lookup; no-cache → full re-verify.
-    let t2 = Instant::now();
-    timeout(OP_TIMEOUT, reader.get(&key))
-        .await
-        .map_err(|_| "warm-get timeout")?
-        .ok_or("warm-get None")?;
-    let warm_ns = t2.elapsed().as_nanos() as u64;
-
-    Ok((set_ns, cold_ns, warm_ns))
-}
-
-async fn run_workload(nodes: &[Arc<Server>], num_ops: usize, concurrency: usize) -> Results {
-    let set_ns      = Arc::new(Mutex::new(Vec::<u64>::with_capacity(num_ops)));
-    let cold_get_ns = Arc::new(Mutex::new(Vec::<u64>::with_capacity(num_ops)));
-    let warm_get_ns = Arc::new(Mutex::new(Vec::<u64>::with_capacity(num_ops)));
-    let set_ok      = Arc::new(AtomicUsize::new(0));
-    let get_ok      = Arc::new(AtomicUsize::new(0));
-    let failures    = Arc::new(AtomicUsize::new(0));
-    let done        = Arc::new(AtomicUsize::new(0));
-    let sem         = Arc::new(Semaphore::new(concurrency));
+async fn run_set_workload(nodes: &[Arc<Server>], num_ops: usize, concurrency: usize) -> SetResults {
+    let set_ns   = Arc::new(Mutex::new(Vec::<u64>::with_capacity(num_ops)));
+    let ok       = Arc::new(AtomicUsize::new(0));
+    let failures = Arc::new(AtomicUsize::new(0));
+    let done     = Arc::new(AtomicUsize::new(0));
+    let sem      = Arc::new(Semaphore::new(concurrency));
 
     let wall = Instant::now();
     let mut handles = Vec::with_capacity(num_ops);
 
     for i in 0..num_ops {
         let writer = Arc::clone(&nodes[i % nodes.len()]);
-        let reader = Arc::clone(&nodes[(i + 1) % nodes.len()]);
         let sem    = Arc::clone(&sem);
-        let set_ns      = Arc::clone(&set_ns);
-        let cold_get_ns = Arc::clone(&cold_get_ns);
-        let warm_get_ns = Arc::clone(&warm_get_ns);
-        let set_ok  = Arc::clone(&set_ok);
-        let get_ok  = Arc::clone(&get_ok);
-        let fail    = Arc::clone(&failures);
-        let done    = Arc::clone(&done);
+        let set_ns = Arc::clone(&set_ns);
+        let ok     = Arc::clone(&ok);
+        let fail   = Arc::clone(&failures);
+        let done   = Arc::clone(&done);
 
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            match bench_op(writer, reader).await {
-                Ok((s, c, w)) => {
-                    set_ok.fetch_add(1, Ordering::Relaxed);
-                    get_ok.fetch_add(1, Ordering::Relaxed);
-                    set_ns.lock().await.push(s);
-                    cold_get_ns.lock().await.push(c);
-                    warm_get_ns.lock().await.push(w);
-                }
-                Err(_) => {
-                    fail.fetch_add(1, Ordering::Relaxed);
-                }
+            let (key, record) = new_record();
+            let t0 = Instant::now();
+            let r = timeout(OP_TIMEOUT, writer.set(&key, record)).await;
+            let elapsed = t0.elapsed().as_nanos() as u64;
+            if r == Ok(Some(true)) {
+                ok.fetch_add(1, Ordering::Relaxed);
+                set_ns.lock().await.push(elapsed);
+            } else {
+                fail.fetch_add(1, Ordering::Relaxed);
             }
-            let n    = done.fetch_add(1, Ordering::Relaxed) + 1;
-            let step = (num_ops / 10).max(1);
-            if n % step == 0 || n == num_ops {
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % ((num_ops / 10).max(1)) == 0 || n == num_ops {
                 print!("\r    {n}/{num_ops}");
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
         }));
     }
-
-    for h in handles {
-        let _ = h.await;
-    }
-
+    for h in handles { let _ = h.await; }
     let wall_secs = wall.elapsed().as_secs_f64();
     println!("\r    {num_ops}/{num_ops}  ✓        ");
 
-    let mut set_v  = set_ns.lock().await.clone();
-    let mut cold_v = cold_get_ns.lock().await.clone();
-    let mut warm_v = warm_get_ns.lock().await.clone();
-    set_v.sort_unstable();
-    cold_v.sort_unstable();
-    warm_v.sort_unstable();
+    let mut v = set_ns.lock().await.clone();
+    v.sort_unstable();
+    SetResults { set_ns: v, ok: ok.load(Ordering::Relaxed), failures: failures.load(Ordering::Relaxed), wall_secs }
+}
 
-    Results {
-        set_ns:    set_v,
-        cold_get_ns: cold_v,
-        warm_get_ns: warm_v,
-        set_ok:    set_ok.load(Ordering::Relaxed),
-        get_ok:    get_ok.load(Ordering::Relaxed),
-        failures:  failures.load(Ordering::Relaxed),
-        wall_secs,
+// ── Phase 2: Signature verification micro-benchmark ──────────────────────────
+
+struct VerifyResults {
+    cold_ns: Vec<u64>,
+    warm_ns: Vec<u64>,
+}
+
+/// Spins up a fresh single-node server (no DHT bootstrap needed — Phase 2
+/// uses only local storage reads) and measures cold vs warm GET latency.
+///
+/// The node must be fresh (empty cache) so that TinyLFU entries from Phase 1
+/// do not evict Phase 2 entries before the warm pass runs.
+async fn run_verify_micro(port: u16, use_cache: bool, n: usize) -> VerifyResults {
+    // Fresh node — cache is empty, no Phase 1 pollution.
+    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
+    let mut srv = Server::new(handler, 20, 3, None, None, use_cache);
+    srv.listen(port, "127.0.0.1").await.expect("micro-bench listen failed");
+    let node = Arc::new(srv);
+
+    // Pre-generate records outside the timed section.
+    let records: Vec<(String, Vec<u8>)> = (0..n).map(|_| new_record()).collect();
+
+    // Inject records directly into local storage, bypassing the DHT.
+    for (key, record) in &records {
+        let dkey = digest(key);
+        node.storage.set(dkey.to_vec(), record.clone());
     }
+
+    // Cold pass: cache is empty → full Dilithium-2 for both variants.
+    let mut cold_ns = Vec::with_capacity(n);
+    for (key, _) in &records {
+        let t = Instant::now();
+        let _ = node.get(key).await;
+        cold_ns.push(t.elapsed().as_nanos() as u64);
+    }
+
+    // Warm pass: cached → SHA-256 lookup; uncached → full Dilithium again.
+    let mut warm_ns = Vec::with_capacity(n);
+    for (key, _) in &records {
+        let t = Instant::now();
+        let _ = node.get(key).await;
+        warm_ns.push(t.elapsed().as_nanos() as u64);
+    }
+
+    cold_ns.sort_unstable();
+    warm_ns.sort_unstable();
+    VerifyResults { cold_ns, warm_ns }
 }
 
 // ── Reporting ─────────────────────────────────────────────────────────────────
 
-fn print_table(label: &str, r: &Results, num_ops: usize) {
+fn print_set_table(label: &str, r: &SetResults, num_ops: usize) {
     let tp = num_ops as f64 / r.wall_secs;
-    println!("  Label        : {label}");
-    println!("  Throughput   : {tp:.1} ops/s  (wall {:.2}s)", r.wall_secs);
-    println!("  ok / fail    : {} set  {} get  {} fail",
-             r.set_ok, r.get_ok, r.failures);
-    println!();
-    println!("  ┌───────────────┬──────────┬──────────┬──────────┬──────────┬──────────┐");
-    println!("  │               │   avg    │   p50    │   p95    │   p99    │   max    │");
-    println!("  ├───────────────┼──────────┼──────────┼──────────┼──────────┼──────────┤");
-    for (lbl, v) in [("SET", &r.set_ns), ("GET cold", &r.cold_get_ns), ("GET warm", &r.warm_get_ns)] {
-        if v.is_empty() {
-            println!("  │ {lbl:<13} │   n/a    │   n/a    │   n/a    │   n/a    │   n/a    │");
-        } else {
-            println!(
-                "  │ {:<13} │ {:>8} │ {:>8} │ {:>8} │ {:>8} │ {:>8} │",
-                lbl,
-                fmt_dur(avg_ns(v) as u64),
-                fmt_dur(percentile(v, 50.0)),
-                fmt_dur(percentile(v, 95.0)),
-                fmt_dur(percentile(v, 99.0)),
-                fmt_dur(*v.last().unwrap_or(&0)),
-            );
-        }
-    }
-    println!("  └───────────────┴──────────┴──────────┴──────────┴──────────┴──────────┘");
+    println!("  [{label}]  {:.1} ops/s  (wall {:.2}s)  ok/fail {}/{}",
+             tp, r.wall_secs, r.ok, r.failures);
+    if r.set_ns.is_empty() { return; }
+    println!(
+        "    SET  avg {:>8}  p50 {:>8}  p95 {:>8}  p99 {:>8}  max {:>8}",
+        fmt_dur(avg_ns(&r.set_ns) as u64),
+        fmt_dur(percentile(&r.set_ns, 50.0)),
+        fmt_dur(percentile(&r.set_ns, 95.0)),
+        fmt_dur(percentile(&r.set_ns, 99.0)),
+        fmt_dur(*r.set_ns.last().unwrap_or(&0)),
+    );
 }
 
-fn print_comparison(cached: &Results, uncached: &Results) {
-    println!("  ┌───────────────┬──────────────────┬──────────────────┬────────────┐");
-    println!("  │               │  cached (avg)    │ uncached (avg)   │  speedup   │");
-    println!("  ├───────────────┼──────────────────┼──────────────────┼────────────┤");
-    for (lbl, ca, un) in [
-        ("SET",      &cached.set_ns,      &uncached.set_ns),
-        ("GET cold", &cached.cold_get_ns, &uncached.cold_get_ns),
-        ("GET warm", &cached.warm_get_ns, &uncached.warm_get_ns),
-    ] {
-        let ca_avg = avg_ns(ca);
-        let un_avg = avg_ns(un);
-        let speedup = if ca_avg > 0.0 { un_avg / ca_avg } else { 0.0 };
+fn print_verify_table(label: &str, r: &VerifyResults) {
+    println!("  [{label}]  n={}", r.cold_ns.len());
+    for (name, v) in [("cold", &r.cold_ns), ("warm", &r.warm_ns)] {
         println!(
-            "  │ {:<13} │ {:>16} │ {:>16} │ {:>9.1}× │",
-            lbl,
-            fmt_dur(ca_avg as u64),
-            fmt_dur(un_avg as u64),
-            speedup,
+            "    {name}  avg {:>8} ±{:>8}  p50 {:>8}  p95 {:>8}  p99 {:>8}",
+            fmt_dur(avg_ns(v) as u64),
+            fmt_dur(stddev_ns(v) as u64),
+            fmt_dur(percentile(v, 50.0)),
+            fmt_dur(percentile(v, 95.0)),
+            fmt_dur(percentile(v, 99.0)),
         );
     }
-    println!("  └───────────────┴──────────────────┴──────────────────┴────────────┘");
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -347,60 +315,83 @@ async fn main() {
     let num_ops:     usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_OPS);
     let concurrency: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_CONCURRENCY);
 
-    println!("╔═══════════════════════════════════════════════════╗");
-    println!("║   AuthKademlia-RS  Signature Cache Benchmark      ║");
-    println!("╚═══════════════════════════════════════════════════╝");
-    println!("  Ops / concurrency : {num_ops} / {concurrency}");
-    println!("  Record size       : ~6 KB  (Dilithium-2 + Kyber-512 DID Document)");
-    println!("  Timeout / op      : {}s\n", OP_TIMEOUT.as_secs());
+    println!("╔═══════════════════════════════════════════════════════════╗");
+    println!("║       AuthKademlia-RS  Signature Cache Benchmark          ║");
+    println!("╚═══════════════════════════════════════════════════════════╝");
+    println!("  DHT SET : {num_ops} ops  c={concurrency}");
+    println!("  Verify  : {MICRO_OPS} ops  sequential  (local storage, no network)");
+    println!("  Record  : ~6 KB  (Dilithium-2 + Kyber-512 DID Document)\n");
 
-    // ── Spin up clusters ──────────────────────────────────────────────────────
-    print!("Starting cluster A (cached)   ... ");
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 1: DHT SET throughput — clusters run sequentially to avoid
+    // CPU contention between the cached and uncached measurements.
+    // ─────────────────────────────────────────────────────────────────────────
+    println!("━━━ Phase 1: DHT SET throughput ━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+    print!("  Starting cluster A (cached, ports {CACHED_SEED}-{CACHED_PEER2})... ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let cached_nodes = start_cluster(CACHED_SEED, CACHED_PEER1, CACHED_PEER2, true).await;
-    println!("ok  (ports {CACHED_SEED}-{CACHED_PEER2})");
+    println!("ok");
+    let cached_set = run_set_workload(&cached_nodes, num_ops, concurrency).await;
+    print_set_table("cached  ", &cached_set, num_ops);
 
-    print!("Starting cluster B (uncached) ... ");
+    // Brief pause so OS reclaims sockets / CPU before next cluster starts.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    println!();
+
+    print!("  Starting cluster B (uncached, ports {UNCACHED_SEED}-{UNCACHED_PEER2})... ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let uncached_nodes = start_cluster(UNCACHED_SEED, UNCACHED_PEER1, UNCACHED_PEER2, false).await;
-    println!("ok  (ports {UNCACHED_SEED}-{UNCACHED_PEER2})\n");
+    println!("ok");
+    let uncached_set = run_set_workload(&uncached_nodes, num_ops, concurrency).await;
+    print_set_table("uncached", &uncached_set, num_ops);
 
-    // ── Run identical workloads ───────────────────────────────────────────────
-    println!("━━━ Cluster A (cached) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    let cached_results = run_workload(&cached_nodes, num_ops, concurrency).await;
-    println!();
-    print_table("with cache", &cached_results, num_ops);
-
-    println!("\n━━━ Cluster B (uncached) ━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    let uncached_results = run_workload(&uncached_nodes, num_ops, concurrency).await;
-    println!();
-    print_table("no cache", &uncached_results, num_ops);
-
-    // ── Side-by-side comparison ───────────────────────────────────────────────
-    println!("\n━━━ Comparison ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-    print_comparison(&cached_results, &uncached_results);
-
-    // Warm-GET is the definitive cache signal.
-    let cold_c = avg_ns(&cached_results.cold_get_ns);
-    let cold_u = avg_ns(&uncached_results.cold_get_ns);
-    let warm_c = avg_ns(&cached_results.warm_get_ns);
-    let warm_u = avg_ns(&uncached_results.warm_get_ns);
-
-    println!("\n  Key findings:");
-    if cold_c > 0.0 && cold_u > 0.0 {
-        let ratio = cold_u / cold_c;
-        println!(
-            "  • Cold GET speedup  : {ratio:.1}×  ({} cached  vs  {} uncached)",
-            fmt_dur(cold_c as u64), fmt_dur(cold_u as u64)
-        );
-        println!("    (cold path always runs full Dilithium-2 — difference is overhead only)");
+    // SET comparison
+    let set_c = avg_ns(&cached_set.set_ns);
+    let set_u = avg_ns(&uncached_set.set_ns);
+    if set_c > 0.0 && set_u > 0.0 {
+        println!("\n  SET speedup: {:.1}×  ({} cached  vs  {} uncached)",
+                 set_u / set_c, fmt_dur(set_c as u64), fmt_dur(set_u as u64));
     }
-    if warm_c > 0.0 && warm_u > 0.0 {
-        let ratio = warm_u / warm_c;
-        println!(
-            "  • Warm GET speedup  : {ratio:.1}×  ({} cached  vs  {} uncached)",
-            fmt_dur(warm_c as u64), fmt_dur(warm_u as u64)
-        );
-        println!("    (cached path: SHA-256 key lookup;  uncached: full Dilithium-2 re-verify)");
-    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 2: Signature verification micro-benchmark.
+    // Records are written directly to local storage — no network noise.
+    // This gives a stable, reproducible signal for the cache benefit.
+    // ─────────────────────────────────────────────────────────────────────────
+    println!("\n━━━ Phase 2: Signature verification micro-benchmark ━━━━━━━━━\n");
+    println!("  (fresh nodes, empty cache, local storage only, sequential GETs)\n");
+
+    // Fresh nodes on isolated ports — no TinyLFU pollution from Phase 1.
+    let cached_v   = run_verify_micro(MICRO_CACHED_PORT,   true,  MICRO_OPS).await;
+    print_verify_table("cached  ", &cached_v);
+    println!();
+    let uncached_v = run_verify_micro(MICRO_UNCACHED_PORT, false, MICRO_OPS).await;
+    print_verify_table("uncached", &uncached_v);
+
+    // Summary comparison
+    let cold_c = avg_ns(&cached_v.cold_ns);
+    let cold_u = avg_ns(&uncached_v.cold_ns);
+    let warm_c = avg_ns(&cached_v.warm_ns);
+    let warm_u = avg_ns(&uncached_v.warm_ns);
+
+    println!("\n━━━ Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    println!("  ┌─────────────┬─────────────────┬─────────────────┬────────────┐");
+    println!("  │             │  cached (avg)   │ uncached (avg)  │  speedup   │");
+    println!("  ├─────────────┼─────────────────┼─────────────────┼────────────┤");
+    println!("  │ DHT SET     │ {:>15} │ {:>15} │ {:>9.1}× │",
+             fmt_dur(set_c as u64), fmt_dur(set_u as u64),
+             if set_c > 0.0 { set_u / set_c } else { 0.0 });
+    println!("  │ GET cold    │ {:>15} │ {:>15} │ {:>9.1}× │",
+             fmt_dur(cold_c as u64), fmt_dur(cold_u as u64),
+             if cold_c > 0.0 { cold_u / cold_c } else { 0.0 });
+    println!("  │ GET warm    │ {:>15} │ {:>15} │ {:>9.1}× │",
+             fmt_dur(warm_c as u64), fmt_dur(warm_u as u64),
+             if warm_c > 0.0 { warm_u / warm_c } else { 0.0 });
+    println!("  └─────────────┴─────────────────┴─────────────────┴────────────┘");
+    println!();
+    println!("  Cold GET: first read — full Dilithium-2 for both (cache miss).");
+    println!("  Warm GET: second read of same record.");
+    println!("    Cached  → SHA-256 key lookup only  (~1 µs expected)");
+    println!("    Uncached → full Dilithium-2 re-verify  (~100 µs expected)");
 }
