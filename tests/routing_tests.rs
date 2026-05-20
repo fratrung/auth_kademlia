@@ -91,7 +91,10 @@ fn test_find_neighbors_sorted_by_xor_distance() {
     let distances: Vec<u128> = found.iter().map(|n| n.distance_to(&target)).collect();
     let mut sorted = distances.clone();
     sorted.sort_unstable();
-    assert_eq!(distances, sorted, "results must be in ascending XOR-distance order");
+    assert_eq!(
+        distances, sorted,
+        "results must be in ascending XOR-distance order"
+    );
 }
 
 /// A peer passed as `exclude` is absent from the result list.
@@ -136,7 +139,10 @@ fn test_is_new_node_detection() {
 
     assert!(rt.is_new_node(&peer), "peer should be new before insertion");
     rt.add_contact(peer.clone());
-    assert!(!rt.is_new_node(&peer), "peer should be known after insertion");
+    assert!(
+        !rt.is_new_node(&peer),
+        "peer should be known after insertion"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,7 +225,11 @@ fn test_distance_is_symmetric() {
 fn test_distinct_nodes_have_nonzero_distance() {
     let a = make_node("node_a");
     let b = make_node("node_b");
-    assert_ne!(a.distance_to(&b), 0, "distinct nodes should have non-zero XOR distance");
+    assert_ne!(
+        a.distance_to(&b),
+        0,
+        "distinct nodes should have non-zero XOR distance"
+    );
 }
 
 /// `address()` returns Some only when both ip and port are set.
@@ -277,7 +287,10 @@ fn test_nodeheap_iter_distance_order() {
     let distances: Vec<u128> = nodes.iter().map(|n| n.distance_to(&pivot)).collect();
     let mut sorted = distances.clone();
     sorted.sort_unstable();
-    assert_eq!(distances, sorted, "heap iteration must yield nodes in ascending distance order");
+    assert_eq!(
+        distances, sorted,
+        "heap iteration must yield nodes in ascending distance order"
+    );
 }
 
 /// `mark_contacted` moves a node out of `get_uncontacted`.
@@ -288,9 +301,15 @@ fn test_nodeheap_contact_tracking() {
     let peer = make_node("ct_peer");
     heap.push_one(peer.clone());
 
-    assert!(!heap.have_contacted_all(), "should have at least one uncontacted node");
+    assert!(
+        !heap.have_contacted_all(),
+        "should have at least one uncontacted node"
+    );
     heap.mark_contacted(&peer);
-    assert!(heap.have_contacted_all(), "after marking, all nodes should be contacted");
+    assert!(
+        heap.have_contacted_all(),
+        "after marking, all nodes should be contacted"
+    );
 }
 
 /// `get_uncontacted` returns only nodes not yet contacted.

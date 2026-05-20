@@ -117,10 +117,11 @@ fn public_key_from_did_doc(data: &[u8]) -> Result<Vec<u8>, AuthHandlerError> {
     let doc: Value = serde_json::from_slice(data)?;
     let x = doc["verificationMethod"][0]["publicKeyJwk"]["x"]
         .as_str()
-        .ok_or_else(|| AuthHandlerError::MissingField("verificationMethod[0].publicKeyJwk.x".into()))?;
+        .ok_or_else(|| {
+            AuthHandlerError::MissingField("verificationMethod[0].publicKeyJwk.x".into())
+        })?;
     decode_b64url(x)
 }
-
 
 /// Concrete handler that verifies Dilithium-signed DID Document records.
 pub struct DIDSignatureVerifierHandler {
@@ -135,9 +136,10 @@ impl DIDSignatureVerifierHandler {
     /// issuer node's Dilithium public key. The file is read lazily on each
     /// issuer-verification call so that key rotation does not require a restart.
     pub fn new(issuer_pub_key_path: impl Into<PathBuf>) -> Self {
-        Self { issuer_pub_key_path: issuer_pub_key_path.into() }
+        Self {
+            issuer_pub_key_path: issuer_pub_key_path.into(),
+        }
     }
-
 
     fn load_issuer_pub_key(&self) -> Result<Vec<u8>, AuthHandlerError> {
         Ok(std::fs::read(&self.issuer_pub_key_path)?)
@@ -175,7 +177,6 @@ impl DIDSignatureVerifierHandler {
             return Ok(false);
         }
 
-        
         self.verify_self_signed(new_value)
     }
 }

@@ -23,7 +23,11 @@ pub struct KBucket {
 impl KBucket {
     /// Create an empty bucket covering `range`.
     pub fn new(range: RangeInclusive<u128>, ksize: usize) -> Self {
-        Self { range, nodes: VecDeque::new(), ksize }
+        Self {
+            range,
+            nodes: VecDeque::new(),
+            ksize,
+        }
     }
 
     /// Insert or refresh `node`.
@@ -101,9 +105,12 @@ impl RoutingTable {
     /// Create a routing table with a single bucket spanning the full keyspace.
     pub fn new(node: Node, ksize: usize) -> Self {
         let bucket = KBucket::new(0..=u128::MAX, ksize);
-        Self { node, ksize, buckets: vec![bucket] }
+        Self {
+            node,
+            ksize,
+            buckets: vec![bucket],
+        }
     }
-
 
     /// Add a contact to the routing table.
     ///
@@ -144,7 +151,6 @@ impl RoutingTable {
         !self.buckets[idx].contains(node)
     }
 
-
     /// Return the `k` nodes closest to `target`, optionally excluding one node.
     ///
     /// Collects candidates from all buckets, sorts by XOR distance to
@@ -154,7 +160,7 @@ impl RoutingTable {
             .buckets
             .iter()
             .flat_map(|b| b.nodes().iter().cloned())
-            .filter(|n| exclude.map_or(true, |ex| n.id != ex.id))
+            .filter(|n| exclude.is_none_or(|ex| n.id != ex.id))
             .collect();
 
         candidates.sort_unstable_by_key(|n| n.distance_to(target));
@@ -166,7 +172,6 @@ impl RoutingTable {
     pub fn lonely_buckets(&self) -> Vec<&KBucket> {
         self.buckets.iter().filter(|b| b.is_lonely()).collect()
     }
-
 
     /// Split bucket at `idx` into two equal halves.
     ///
@@ -197,7 +202,6 @@ impl RoutingTable {
         self.buckets.insert(idx, low_bucket);
     }
 
-
     /// Return the index of the bucket whose range contains `long_id`.
     ///
     /// Uses a linear scan over the (typically small) bucket list. For very
@@ -209,7 +213,7 @@ impl RoutingTable {
             .position(|b| b.covers(long_id))
             .unwrap_or(self.buckets.len() - 1)
     }
-    
+
     pub fn buckets(&self) -> &Vec<KBucket> {
         &self.buckets
     }

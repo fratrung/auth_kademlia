@@ -59,8 +59,8 @@ fn load_public_key(key: &[u8]) -> Result<RsaPublicKey, VerifierError> {
         return Ok(pk);
     }
     // Fall back to PEM.
-    let pem = std::str::from_utf8(key)
-        .map_err(|e| VerifierError::VerificationFailed(e.to_string()))?;
+    let pem =
+        std::str::from_utf8(key).map_err(|e| VerifierError::VerificationFailed(e.to_string()))?;
     RsaPublicKey::from_public_key_pem(pem)
         .map_err(|e| VerifierError::VerificationFailed(e.to_string()))
 }
@@ -89,10 +89,9 @@ fn load_private_key(key: &[u8]) -> Result<RsaPrivateKey, VerifierError> {
     if let Ok(pk) = RsaPrivateKey::from_pkcs8_der(key) {
         return Ok(pk);
     }
-    let pem = std::str::from_utf8(key)
-        .map_err(|e| VerifierError::VerificationFailed(e.to_string()))?;
-    RsaPrivateKey::from_pkcs8_pem(pem)
-        .map_err(|e| VerifierError::VerificationFailed(e.to_string()))
+    let pem =
+        std::str::from_utf8(key).map_err(|e| VerifierError::VerificationFailed(e.to_string()))?;
+    RsaPrivateKey::from_pkcs8_pem(pem).map_err(|e| VerifierError::VerificationFailed(e.to_string()))
 }
 
 #[cfg(test)]

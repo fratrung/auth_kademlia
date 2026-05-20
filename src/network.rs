@@ -8,26 +8,33 @@ use std::time::Duration;
 
 use log;
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
 
 use crate::auth_handler::SignatureVerifierHandler;
 use crate::crawling::{NodeSpiderCrawl, ValueSpiderCrawl};
 use crate::node::Node;
 use crate::protocol::KademliaProtocol;
+use crate::signature_cache::SignatureCache;
 use crate::storage::{ForgetfulStorage, IStorage};
 use crate::utils::{digest, digest_bytes, ID_LEN};
 
 const STATUS_LIST_KEY: &str = "did:iiot:status-list";
 
+/// Number of parallel datagram workers in the UDP receive loop.
+const DATAGRAM_WORKERS: usize = 4;
+
 pub struct Server {
     pub ksize: usize,
     pub alpha: usize,
-    pub storage: Arc<RwLock<ForgetfulStorage>>,
+    pub storage: Arc<ForgetfulStorage>,
     pub node: Node,
     pub protocol: Option<Arc<KademliaProtocol>>,
     refresh_loop: Option<tokio::task::JoinHandle<()>>,
     save_state_loop: Option<tokio::task::JoinHandle<()>>,
     signature_handler: Arc<dyn SignatureVerifierHandler>,
+    // Cache verification results so repeated local reads of the same record
+    // don't pay full Dilithium cost. Any byte change → different SHA-256 key
+    // → cache miss → full re-verification. Safe to use even for local reads.
+    sig_cache: SignatureCache,
 }
 
 impl Server {
@@ -43,10 +50,9 @@ impl Server {
         ksize: usize,
         alpha: usize,
         node_id: Option<[u8; ID_LEN]>,
-        storage: Option<Arc<RwLock<ForgetfulStorage>>>,
+        storage: Option<Arc<ForgetfulStorage>>,
     ) -> Self {
-        let storage =
-            storage.unwrap_or_else(|| Arc::new(RwLock::new(ForgetfulStorage::new(-1))));
+        let storage = storage.unwrap_or_else(|| Arc::new(ForgetfulStorage::new(-1)));
 
         let node = match node_id {
             Some(id) => Node::from_id(id),
@@ -67,11 +73,11 @@ impl Server {
             refresh_loop: None,
             save_state_loop: None,
             signature_handler,
+            sig_cache: SignatureCache::new(4096),
         }
     }
 
-
-    /// Bind to `interface:port` and start the UDP receive loop.
+    /// Bind to `interface:port` and start the UDP receive loop with a worker pool.
     pub async fn listen(&mut self, port: u16, interface: &str) -> tokio::io::Result<()> {
         let addr = format!("{}:{}", interface, port);
         let socket = Arc::new(UdpSocket::bind(&addr).await?);
@@ -86,16 +92,34 @@ impl Server {
         ));
         self.protocol = Some(Arc::clone(&protocol));
 
-        // Spawn the UDP receive loop.
-        let proto_rx = Arc::clone(&protocol);
+        // Bounded channel + fixed worker pool to bound task explosion under burst load.
+        let (tx, rx) = tokio::sync::mpsc::channel::<(Vec<u8>, std::net::SocketAddr)>(1024);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+
+        for _ in 0..DATAGRAM_WORKERS {
+            let rx = Arc::clone(&rx);
+            let proto = Arc::clone(&protocol);
+            tokio::spawn(async move {
+                loop {
+                    let item = rx.lock().await.recv().await;
+                    match item {
+                        Some((data, peer)) => proto.handle_datagram(data, peer).await,
+                        None => break, // channel closed
+                    }
+                }
+            });
+        }
+
+        // Recv loop: read datagrams and enqueue them.
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65_536];
             loop {
-                match proto_rx.socket.recv_from(&mut buf).await {
+                match socket.recv_from(&mut buf).await {
                     Ok((len, peer)) => {
                         let data = buf[..len].to_vec();
-                        let p = Arc::clone(&proto_rx);
-                        tokio::spawn(async move { p.handle_datagram(data, peer).await });
+                        if tx.send((data, peer)).await.is_err() {
+                            break; // workers dropped
+                        }
                     }
                     Err(e) => log::error!("UDP recv error: {}", e),
                 }
@@ -127,7 +151,6 @@ impl Server {
             h.abort();
         }
     }
-
 
     /// Bootstrap the node by contacting a list of known peers.
     ///
@@ -172,24 +195,34 @@ impl Server {
         Some(Node::new(id, Some(addr.0), Some(addr.1)))
     }
 
-
     /// Look up `key` in the DHT.
     ///
-    /// Checks local storage first, then performs an iterative lookup.
-    /// Returns `None` if not found or if the signature is invalid.
+    /// Checks local storage first, then performs an iterative network lookup.
+    /// The Dilithium signature is verified on every hit (local via cache, network inline).
+    /// Returns `None` if the key is not found or the signature is invalid.
     pub async fn get(&self, key: &str) -> Option<Vec<u8>> {
         log::info!("get({})", key);
         let dkey = digest(key);
 
-        // Scope the lock so the MutexGuard is dropped before any await point.
-        let local: Option<Vec<u8>> = self.storage.read().await.get(&dkey);
-        if let Some(result) = local {
-            return if self.verify_value(key, &result) { Some(result) } else { None };
+        // Local hits are re-verified via the signature cache: first access pays
+        // full Dilithium cost; subsequent reads of the same record are O(1).
+        // This matches the paper (§4.4): "the requesting node verifies the
+        // signature before accepting the record."
+        if let Some(result) = self.storage.get(&dkey) {
+            return if self.verify_value(key, &result) {
+                Some(result)
+            } else {
+                None
+            };
         }
 
         let proto = self.protocol.as_ref()?;
 
-        let nearest: Vec<Node> = proto.router.read().await.find_neighbors(&Node::from_id(dkey), None);
+        let nearest: Vec<Node> = proto
+            .router
+            .read()
+            .await
+            .find_neighbors(&Node::from_id(dkey), None);
         if nearest.is_empty() {
             log::warn!("get({}): no known neighbours", key);
             return None;
@@ -205,6 +238,7 @@ impl Server {
         .find()
         .await;
 
+        // Still verify values fetched from remote nodes (untrusted source).
         match result {
             Some(v) if self.verify_value(key, &v) => Some(v),
             _ => None,
@@ -312,12 +346,15 @@ impl Server {
         .find()
         .await;
 
-        log::info!("set_digest {}: storing on {} nodes", hex::encode(dkey), nodes.len());
+        log::info!(
+            "set_digest {}: storing on {} nodes",
+            hex::encode(dkey),
+            nodes.len()
+        );
 
-        // Store locally if we are among the k-closest.
         if let Some(farthest) = nodes.iter().map(|n| n.distance_to(&node)).max() {
             if self.node.distance_to(&node) < farthest {
-                self.storage.write().await.set(dkey.to_vec(), value.clone());
+                self.storage.set(dkey.to_vec(), value.clone());
             }
         }
 
@@ -361,7 +398,7 @@ impl Server {
 
         if let Some(farthest) = nodes.iter().map(|n| n.distance_to(&node)).max() {
             if self.node.distance_to(&node) < farthest {
-                self.storage.write().await.set(dkey.to_vec(), value.clone());
+                self.storage.set(dkey.to_vec(), value.clone());
             }
         }
 
@@ -400,30 +437,28 @@ impl Server {
         };
 
         // Always delete locally first — the caller has already verified the
-        // signature and confirmed the record exists. Remote propagation is
-        // best-effort: in a 2-node case the remote peer may never have stored
-        // the record locally (because it was farther from the key), so a
-        // failing remote RPC must not count as a failed delete overall.
-        self.storage.write().await.delete(&dkey);
+        // signature and confirmed the record exists.
+        self.storage.delete(&dkey);
 
         let node = Node::from_id(dkey);
         let nearest = proto.router.read().await.find_neighbors(&node, None);
         if nearest.is_empty() {
-            log::warn!("delete_digest {}: no neighbours, local delete only", hex::encode(dkey));
+            log::warn!(
+                "delete_digest {}: no neighbours, local delete only",
+                hex::encode(dkey)
+            );
             return true;
         }
 
-        let nodes = NodeSpiderCrawl::new(
-            Arc::clone(proto),
-            node,
-            nearest,
-            self.ksize,
-            self.alpha,
-        )
-        .find()
-        .await;
+        let nodes = NodeSpiderCrawl::new(Arc::clone(proto), node, nearest, self.ksize, self.alpha)
+            .find()
+            .await;
 
-        log::info!("delete_digest {}: propagating to {} nodes", hex::encode(dkey), nodes.len());
+        log::info!(
+            "delete_digest {}: propagating to {} nodes",
+            hex::encode(dkey),
+            nodes.len()
+        );
 
         let mut futs = vec![];
         for n in &nodes {
@@ -438,7 +473,10 @@ impl Server {
     }
 
     fn verify_value(&self, key: &str, value: &[u8]) -> bool {
-        if key == STATUS_LIST_KEY {
+        if let Some(cached) = self.sig_cache.get(value) {
+            return cached;
+        }
+        let result = if key == STATUS_LIST_KEY {
             let ok = self
                 .signature_handler
                 .handle_issuer_node_signature_verification(value)
@@ -451,9 +489,10 @@ impl Server {
             self.signature_handler
                 .handle_signature_verification(value)
                 .unwrap_or(false)
-        }
+        };
+        self.sig_cache.insert(value, result);
+        result
     }
-
 
     /// Return the addresses of bootstrappable neighbour nodes.
     pub async fn bootstrappable_neighbors(&self) -> Vec<(String, u16)> {
@@ -525,7 +564,6 @@ impl Server {
         }
     }
 
-
     fn schedule_refresh(&mut self) {
         let proto = match &self.protocol {
             Some(p) => Arc::clone(p),
@@ -546,19 +584,14 @@ impl Server {
                 for rid in refresh_ids {
                     let rnode = Node::from_id(rid);
                     let neighbors = proto.router.read().await.find_neighbors(&rnode, None);
-                    let spider = NodeSpiderCrawl::new(
-                        Arc::clone(&proto),
-                        rnode,
-                        neighbors,
-                        ksize,
-                        alpha,
-                    );
+                    let spider =
+                        NodeSpiderCrawl::new(Arc::clone(&proto), rnode, neighbors, ksize, alpha);
                     futs.push(spider.find());
                 }
                 futures::future::join_all(futs).await;
 
                 // Republish keys older than one hour.
-                let old_entries = storage.read().await.iter_older_than(3600);
+                let old_entries = storage.iter_older_than(3600);
                 for (key_vec, value) in old_entries {
                     if key_vec.len() != ID_LEN {
                         continue;
@@ -566,20 +599,14 @@ impl Server {
                     let mut dkey = [0u8; ID_LEN];
                     dkey.copy_from_slice(&key_vec);
                     let target = Node::from_id(dkey);
-                    let neighbors =
-                        proto.router.read().await.find_neighbors(&target, None);
+                    let neighbors = proto.router.read().await.find_neighbors(&target, None);
                     if neighbors.is_empty() {
                         continue;
                     }
-                    let nodes = NodeSpiderCrawl::new(
-                        Arc::clone(&proto),
-                        target,
-                        neighbors,
-                        ksize,
-                        alpha,
-                    )
-                    .find()
-                    .await;
+                    let nodes =
+                        NodeSpiderCrawl::new(Arc::clone(&proto), target, neighbors, ksize, alpha)
+                            .find()
+                            .await;
 
                     let mut store_futs = vec![];
                     for n in &nodes {

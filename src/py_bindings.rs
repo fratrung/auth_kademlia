@@ -51,7 +51,6 @@ fn km_err(e: KeyManagerError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
-
 /// Async DHT server exposed to Python.
 ///
 /// Internally wraps [`Server`] behind an `Arc<RwLock<…>>`:
@@ -113,7 +112,9 @@ impl PyServer {
         };
 
         let server = Server::new(handler, ksize, alpha, fixed_id, None);
-        Ok(Self { inner: Arc::new(RwLock::new(server)) })
+        Ok(Self {
+            inner: Arc::new(RwLock::new(server)),
+        })
     }
 
     /// Bind to ``interface:port`` and start the UDP receive loop.
@@ -150,8 +151,7 @@ impl PyServer {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let s = inner.read().await;
             let nodes = s.bootstrap(addrs).await;
-            let peers: Vec<(String, u16)> =
-                nodes.into_iter().filter_map(|n| n.address()).collect();
+            let peers: Vec<(String, u16)> = nodes.into_iter().filter_map(|n| n.address()).collect();
             Ok(peers)
         })
     }
@@ -182,11 +182,16 @@ impl PyServer {
     ///
     /// Returns:
     ///     bool | None: ``True`` on success, ``None`` if rejected.
-    fn set<'py>(&self, py: Python<'py>, key: String, value: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+    fn set<'py>(
+        &self,
+        py: Python<'py>,
+        key: String,
+        value: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // Read lock: Server::set takes &self and is internally thread-safe via
-            // the RwLock on ForgetfulStorage. The lock here only prevents concurrent
+            // DashMap in ForgetfulStorage. The lock here only prevents concurrent
             // listen/stop (write-lock) calls from racing with network operations.
             let s = inner.read().await;
             Ok(s.set(&key, value).await)
@@ -293,13 +298,14 @@ impl PyServer {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // Exclusive lock: save_state_regularly takes &mut self internally.
-            inner.write().await.save_state_regularly(fname, frequency_secs);
+            inner
+                .write()
+                .await
+                .save_state_regularly(fname, frequency_secs);
             Ok(())
         })
     }
 }
-
-
 
 /// CRYSTALS-Dilithium key manager exposed to Python.
 ///
@@ -315,7 +321,9 @@ pub struct PyDilithiumKeyManager {
 impl PyDilithiumKeyManager {
     #[new]
     fn new(keys_dir: String, security_level: u8) -> Self {
-        Self { inner: DilithiumKeyManager::new(PathBuf::from(keys_dir), security_level) }
+        Self {
+            inner: DilithiumKeyManager::new(PathBuf::from(keys_dir), security_level),
+        }
     }
 
     /// Generate a fresh ``(public_key, private_key)`` pair.
@@ -332,11 +340,15 @@ impl PyDilithiumKeyManager {
     }
 
     fn store_public_key(&self, key_name: String, public_key: Vec<u8>) -> PyResult<()> {
-        self.inner.store_public_key(&key_name, &public_key).map_err(km_err)
+        self.inner
+            .store_public_key(&key_name, &public_key)
+            .map_err(km_err)
     }
 
     fn store_private_key(&self, key_name: String, private_key: Vec<u8>) -> PyResult<()> {
-        self.inner.store_private_key(&key_name, &private_key).map_err(km_err)
+        self.inner
+            .store_private_key(&key_name, &private_key)
+            .map_err(km_err)
     }
 
     fn get_public_key(&self, key_name: String) -> PyResult<Vec<u8>> {
@@ -364,10 +376,11 @@ impl PyDilithiumKeyManager {
         message: Vec<u8>,
         signature: Vec<u8>,
     ) -> PyResult<bool> {
-        self.inner.verify_signature(&public_key, &message, &signature).map_err(km_err)
+        self.inner
+            .verify_signature(&public_key, &message, &signature)
+            .map_err(km_err)
     }
 }
-
 
 /// CRYSTALS-Kyber key manager exposed to Python.
 ///
@@ -385,7 +398,9 @@ pub struct PyKyberKeyManager {
 impl PyKyberKeyManager {
     #[new]
     fn new(keys_dir: String, security_level: u16) -> Self {
-        Self { inner: KyberKeyManager::new(PathBuf::from(keys_dir), security_level) }
+        Self {
+            inner: KyberKeyManager::new(PathBuf::from(keys_dir), security_level),
+        }
     }
 
     /// Args:
@@ -399,11 +414,15 @@ impl PyKyberKeyManager {
     }
 
     fn store_public_key(&self, key_name: String, public_key: Vec<u8>) -> PyResult<()> {
-        self.inner.store_public_key(&key_name, &public_key).map_err(km_err)
+        self.inner
+            .store_public_key(&key_name, &public_key)
+            .map_err(km_err)
     }
 
     fn store_private_key(&self, key_name: String, private_key: Vec<u8>) -> PyResult<()> {
-        self.inner.store_private_key(&key_name, &private_key).map_err(km_err)
+        self.inner
+            .store_private_key(&key_name, &private_key)
+            .map_err(km_err)
     }
 
     fn get_public_key(&self, key_name: String) -> PyResult<Vec<u8>> {
@@ -419,7 +438,6 @@ impl PyKyberKeyManager {
     }
 }
 
-
 /// Ed25519 key manager exposed to Python.
 ///
 /// Args:
@@ -433,7 +451,9 @@ pub struct PyEd25519KeyManager {
 impl PyEd25519KeyManager {
     #[new]
     fn new(keys_dir: String) -> Self {
-        Self { inner: Ed25519KeyManager::new(PathBuf::from(keys_dir)) }
+        Self {
+            inner: Ed25519KeyManager::new(PathBuf::from(keys_dir)),
+        }
     }
 
     fn generate_keypair(&self) -> PyResult<(Vec<u8>, Vec<u8>)> {
@@ -441,11 +461,15 @@ impl PyEd25519KeyManager {
     }
 
     fn store_public_key(&self, key_name: String, public_key: Vec<u8>) -> PyResult<()> {
-        self.inner.store_public_key(&key_name, &public_key).map_err(km_err)
+        self.inner
+            .store_public_key(&key_name, &public_key)
+            .map_err(km_err)
     }
 
     fn store_private_key(&self, key_name: String, private_key: Vec<u8>) -> PyResult<()> {
-        self.inner.store_private_key(&key_name, &private_key).map_err(km_err)
+        self.inner
+            .store_private_key(&key_name, &private_key)
+            .map_err(km_err)
     }
 
     fn get_public_key(&self, key_name: String) -> PyResult<Vec<u8>> {
@@ -470,7 +494,9 @@ impl PyEd25519KeyManager {
         message: Vec<u8>,
         signature: Vec<u8>,
     ) -> PyResult<bool> {
-        self.inner.verify_signature(&public_key, &message, &signature).map_err(km_err)
+        self.inner
+            .verify_signature(&public_key, &message, &signature)
+            .map_err(km_err)
     }
 }
 

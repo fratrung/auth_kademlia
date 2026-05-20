@@ -127,11 +127,11 @@ fn test_sort_json_keys_is_deterministic_and_canonical() {
     let text = String::from_utf8(bytes_1).unwrap();
 
     // Top-level keys must be in alphabetical order: a_key < array < nested < z_key.
-    let pos_a_key  = text.find("\"a_key\"").expect("a_key not found");
-    let pos_array  = text.find("\"array\"").expect("array not found");
+    let pos_a_key = text.find("\"a_key\"").expect("a_key not found");
+    let pos_array = text.find("\"array\"").expect("array not found");
     let pos_nested = text.find("\"nested\"").expect("nested not found");
-    let pos_z_key  = text.find("\"z_key\"").expect("z_key not found");
-    assert!(pos_a_key < pos_array,  "a_key must precede array");
+    let pos_z_key = text.find("\"z_key\"").expect("z_key not found");
+    assert!(pos_a_key < pos_array, "a_key must precede array");
     assert!(pos_array < pos_nested, "array must precede nested");
     assert!(pos_nested < pos_z_key, "nested must precede z_key");
 
@@ -144,7 +144,10 @@ fn test_sort_json_keys_is_deterministic_and_canonical() {
     // second has "y".
     let pos_z_elem = text.find("\"z\":1").expect("\"z\":1 not found");
     let pos_y_elem = text.find("\"y\":2").expect("\"y\":2 not found");
-    assert!(pos_z_elem < pos_y_elem, "array element order must be preserved");
+    assert!(
+        pos_z_elem < pos_y_elem,
+        "array element order must be preserved"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -167,9 +170,18 @@ fn test_resolve_ed25519_length() {
 
 #[test]
 fn test_resolve_dilithium_levels() {
-    assert_eq!(resolve_alg_and_length("Dilithium-2").unwrap(), ("Dilithium".into(), 2420));
-    assert_eq!(resolve_alg_and_length("Dilithium-3").unwrap(), ("Dilithium".into(), 3293));
-    assert_eq!(resolve_alg_and_length("Dilithium-5").unwrap(), ("Dilithium".into(), 4595));
+    assert_eq!(
+        resolve_alg_and_length("Dilithium-2").unwrap(),
+        ("Dilithium".into(), 2420)
+    );
+    assert_eq!(
+        resolve_alg_and_length("Dilithium-3").unwrap(),
+        ("Dilithium".into(), 3293)
+    );
+    assert_eq!(
+        resolve_alg_and_length("Dilithium-5").unwrap(),
+        ("Dilithium".into(), 4595)
+    );
 }
 
 #[test]
@@ -199,7 +211,13 @@ fn test_factory_unknown_algorithm_returns_error() {
 
 #[test]
 fn test_factory_known_algorithms_return_ok() {
-    for alg in &["Dilithium-2", "Dilithium-3", "Dilithium-5", "Ed25519", "RSA"] {
+    for alg in &[
+        "Dilithium-2",
+        "Dilithium-3",
+        "Dilithium-5",
+        "Ed25519",
+        "RSA",
+    ] {
         assert!(
             SignatureVerifierFactory::get_verifier(alg).is_ok(),
             "get_verifier({}) should succeed",
@@ -417,7 +435,9 @@ fn test_did_handler_rejects_tampered_did_document() {
 
     let handler = DIDSignatureVerifierHandler::new(PathBuf::from("irrelevant.bin"));
     // Either returns Err (parse error due to corrupted JSON) or Ok(false).
-    let ok = handler.handle_signature_verification(&record).unwrap_or(false);
+    let ok = handler
+        .handle_signature_verification(&record)
+        .unwrap_or(false);
     assert!(!ok, "tampered DID Document must fail verification");
 }
 
@@ -427,7 +447,9 @@ fn test_did_handler_rejects_malformed_record() {
     let handler = DIDSignatureVerifierHandler::new(PathBuf::from("irrelevant.bin"));
     let short_record = vec![0u8; 5]; // shorter than the 12-byte algorithm field
     assert!(
-        handler.handle_signature_verification(&short_record).is_err(),
+        handler
+            .handle_signature_verification(&short_record)
+            .is_err(),
         "a record shorter than 12 bytes must return an error"
     );
 }
@@ -483,7 +505,9 @@ fn test_did_handler_rejects_update_with_invalid_new_record_self_sig() {
     let new_record = build_record_d2(&new_doc, &wrong_new_sk);
 
     // auth_sig is produced correctly with old_sk
-    let auth_sig = dilithium2::detached_sign(&new_record, &old_sk).as_bytes().to_vec();
+    let auth_sig = dilithium2::detached_sign(&new_record, &old_sk)
+        .as_bytes()
+        .to_vec();
 
     let handler = DIDSignatureVerifierHandler::new(PathBuf::from("irrelevant.bin"));
     assert!(

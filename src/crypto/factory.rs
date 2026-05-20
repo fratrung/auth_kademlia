@@ -30,10 +30,10 @@ impl SignatureVerifierFactory {
     pub fn get_verifier(algorithm: &str) -> Result<Box<dyn SignatureVerifier>, VerifierError> {
         let base = algorithm.split('-').next().unwrap_or("").trim();
         match base {
-            "RSA"       => Ok(Box::new(RSASignatureVerifier)),
-            "Ed25519"   => Ok(Box::new(Ed25519SignatureVerifier)),
+            "RSA" => Ok(Box::new(RSASignatureVerifier)),
+            "Ed25519" => Ok(Box::new(Ed25519SignatureVerifier)),
             "Dilithium" => Ok(Box::new(DilithiumSignatureVerifier)),
-            other       => Err(VerifierError::UnsupportedAlgorithm(other.to_string())),
+            other => Err(VerifierError::UnsupportedAlgorithm(other.to_string())),
         }
     }
 }
@@ -43,10 +43,10 @@ impl SignerFactory {
     pub fn get_signer(algorithm: &str) -> Result<Box<dyn Signer>, VerifierError> {
         let base = algorithm.split('-').next().unwrap_or("").trim();
         match base {
-            "RSA"       => Ok(Box::new(RSASigner)),
-            "Ed25519"   => Ok(Box::new(Ed25519Signer)),
+            "RSA" => Ok(Box::new(RSASigner)),
+            "Ed25519" => Ok(Box::new(Ed25519Signer)),
             "Dilithium" => Ok(Box::new(DilithiumSigner)),
-            other       => Err(VerifierError::UnsupportedAlgorithm(other.to_string())),
+            other => Err(VerifierError::UnsupportedAlgorithm(other.to_string())),
         }
     }
 }

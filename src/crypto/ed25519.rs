@@ -1,3 +1,5 @@
+use ed25519_dalek::Signer as DalekSigner;
+use ed25519_dalek::Verifier as DalekVerifier;
 /// Ed25519 signature verifier and signer.
 ///
 /// Mirrors Python's `Ed25519SignatureVerifier` and `Ed25519Signer`:
@@ -17,8 +19,6 @@
 ///
 /// Public keys are 32 bytes; signatures are 64 bytes.
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
-use ed25519_dalek::Verifier as DalekVerifier;
-use ed25519_dalek::Signer as DalekSigner;
 
 use crate::crypto::signature_verifier::{SignatureVerifier, Signer, VerifierError};
 
@@ -32,9 +32,9 @@ impl SignatureVerifier for Ed25519SignatureVerifier {
         message: &[u8],
     ) -> Result<bool, VerifierError> {
         // Public key must be exactly 32 bytes.
-        let key_bytes: [u8; 32] = public_key.try_into().map_err(|_| {
-            VerifierError::InvalidKeyLength(public_key.len())
-        })?;
+        let key_bytes: [u8; 32] = public_key
+            .try_into()
+            .map_err(|_| VerifierError::InvalidKeyLength(public_key.len()))?;
 
         // Signature must be exactly 64 bytes.
         let sig_bytes: [u8; 64] = signature.try_into().map_err(|_| {
@@ -58,9 +58,9 @@ pub struct Ed25519Signer;
 impl Signer for Ed25519Signer {
     fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<Vec<u8>, VerifierError> {
         // ed25519-dalek expects 32-byte seeds (the private scalar).
-        let key_bytes: [u8; 32] = private_key.try_into().map_err(|_| {
-            VerifierError::InvalidKeyLength(private_key.len())
-        })?;
+        let key_bytes: [u8; 32] = private_key
+            .try_into()
+            .map_err(|_| VerifierError::InvalidKeyLength(private_key.len()))?;
 
         let signing_key = SigningKey::from_bytes(&key_bytes);
         let signature = signing_key.sign(message);
@@ -72,7 +72,7 @@ impl Signer for Ed25519Signer {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use rand::{RngCore, rngs::OsRng};
+    use rand::{rngs::OsRng, RngCore};
 
     fn random_signing_key() -> SigningKey {
         let mut bytes = [0u8; 32];

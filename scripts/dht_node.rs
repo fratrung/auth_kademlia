@@ -12,7 +12,6 @@
 ///                 (pass the same value to the retriever via RETRIEVE_KEY)
 /// RETRIEVE_KEY    DHT key to look up (required when ROLE=retriever)
 /// RUST_LOG        log filter, e.g. "info", "debug", "auth_kademlia_rs=trace"
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,7 +25,6 @@ use pqcrypto_traits::kem::PublicKey as KemPublicKey;
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 use serde_json::{json, Value};
 use uuid::Uuid;
-
 
 fn base64url_encode(pk: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(pk)
@@ -125,7 +123,6 @@ fn decode_record(record: &[u8]) -> Option<String> {
     serde_json::to_string_pretty(&doc).ok()
 }
 
-
 async fn start_server(port: u16) -> Server {
     let issuer_path = PathBuf::from("issuer.bin");
     if !issuer_path.exists() {
@@ -136,7 +133,10 @@ async fn start_server(port: u16) -> Server {
     }
     let handler = Arc::new(DIDSignatureVerifierHandler::new(issuer_path));
     let mut server = Server::new(handler, 20, 3, None, None);
-    server.listen(port, "0.0.0.0").await.expect("Failed to bind UDP socket");
+    server
+        .listen(port, "0.0.0.0")
+        .await
+        .expect("Failed to bind UDP socket");
     log::info!("Node listening on 0.0.0.0:{}", port);
     server
 }
@@ -147,7 +147,10 @@ async fn bootstrap_with_retries(server: &Server, ip: &str, port: u16) -> bool {
     for attempt in 1..=max_retries {
         log::info!(
             "Bootstrap attempt {}/{} → {}:{}",
-            attempt, max_retries, ip, port
+            attempt,
+            max_retries,
+            ip,
+            port
         );
         let discovered = server.bootstrap(vec![(ip.to_string(), port)]).await;
         if !discovered.is_empty() {
@@ -167,10 +170,8 @@ async fn bootstrap_with_retries(server: &Server, ip: &str, port: u16) -> bool {
     false
 }
 
-
 async fn run_publisher(server: &Server) {
-    let uuid = std::env::var("FIXED_DID_UUID")
-        .unwrap_or_else(|_| Uuid::new_v4().to_string());
+    let uuid = std::env::var("FIXED_DID_UUID").unwrap_or_else(|_| Uuid::new_v4().to_string());
     let did = format!("did:iiot:{}", uuid);
     let dht_key = uuid.clone();
 
@@ -187,7 +188,7 @@ async fn run_publisher(server: &Server) {
     log::info!(
         "Publisher: signed record size = {} B ({} fragments over UDP)",
         record.len(),
-        (record.len() + 1399) / 1400,
+        record.len().div_ceil(1400),
     );
 
     let max_attempts = 10;
@@ -208,9 +209,7 @@ async fn run_publisher(server: &Server) {
                             log::debug!("Publisher: DID Document content:\n{}", pretty);
                         }
                     }
-                    None => log::warn!(
-                        "Publisher: local get returned None right after publish"
-                    ),
+                    None => log::warn!("Publisher: local get returned None right after publish"),
                 }
                 return;
             }
@@ -233,7 +232,6 @@ async fn run_publisher(server: &Server) {
     );
 }
 
-
 async fn run_retriever(server: &Server) {
     let key = match std::env::var("RETRIEVE_KEY") {
         Ok(k) => k,
@@ -251,14 +249,13 @@ async fn run_retriever(server: &Server) {
     for attempt in 1..=max_attempts {
         log::info!(
             "Retriever: get attempt {}/{} for key={}",
-            attempt, max_attempts, key
+            attempt,
+            max_attempts,
+            key
         );
         match server.get(&key).await {
             Some(record) => {
-                log::info!(
-                    "Retriever: record found! ({} B, key={})",
-                    record.len(), key
-                );
+                log::info!("Retriever: record found! ({} B, key={})", record.len(), key);
                 match decode_record(&record) {
                     Some(pretty) => {
                         log::info!("Retriever: DID Document:\n{}", pretty);
@@ -270,7 +267,9 @@ async fn run_retriever(server: &Server) {
             None => {
                 log::warn!(
                     "Retriever: key={} not found on attempt {}/{}",
-                    key, attempt, max_attempts
+                    key,
+                    attempt,
+                    max_attempts
                 );
             }
         }
@@ -278,10 +277,10 @@ async fn run_retriever(server: &Server) {
     }
     log::error!(
         "Retriever: key={} not found after {} attempts",
-        key, max_attempts
+        key,
+        max_attempts
     );
 }
-
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -293,17 +292,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let role = std::env::var("ROLE").unwrap_or_else(|_| "publisher".to_string());
 
-    log::info!(
-        "=== DHT node starting | port={} role={} ===",
-        port, role
-    );
+    log::info!("=== DHT node starting | port={} role={} ===", port, role);
 
     let mut server = start_server(port).await;
 
     if std::env::var("IS_SEED").is_ok() {
         log::info!("Running as SEED node — no bootstrap required");
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
     } else if let Ok(addr) = std::env::var("BOOTSTRAP_ADDR") {
         let parts: Vec<&str> = addr.splitn(2, ':').collect();
         if parts.len() != 2 {

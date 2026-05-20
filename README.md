@@ -76,6 +76,20 @@ By inspecting fragments you can identify the internal composition of a PQC recor
 
 -----
 
+## Performance & Concurrency
+
+| Mechanism | Detail |
+|---|---|
+| **Concurrent storage** | `DashMap` replaces `IndexMap + RwLock`. Storage operations on different keys are fully parallel with no single global lock. |
+| **Lazy TTL expiry** | Expired entries are filtered at read time instead of an O(n) scan on every write. |
+| **Signature cache** | `SignatureCache` (moka, SHA-256 keyed, TTL 1 h, 4096 entries). Repeated reads of the same record pay full Dilithium cost only once; subsequent reads are O(1). Any byte-level change forces full re-verification. |
+| **Worker pool** | UDP datagrams are dispatched via a bounded `mpsc::channel(1024)` into 4 fixed workers, capping task count under burst load and providing backpressure. |
+| **Fire-and-forget routing** | Routing table updates (`welcome_if_new`) are spawned as background tasks in all RPC handlers. RPC responses are sent immediately without waiting for routing convergence. |
+| **Replication filter** | On node join, only nodes XOR-closer to a key than the new node replicate it (Kademlia §2.5). Prevents redundant store RPCs from far-away nodes. |
+| **Atomic insert** | `rpc_store` uses a DashMap `Entry`-based `insert_if_absent` — eliminates the TOCTOU race window that existed with the old read-then-write pattern. |
+
+-----
+
 ## DID:IIoT Integration
 
 This implementation is designed to interoperate with the [`did:iiot` method](https://github.com/fratrung/did-iiot), an open DID method targeting **Industrial IoT** environments.
@@ -256,7 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (kyber_pk, _) = kyber512::keypair();
     let did = generate_did_iiot();
     let did_doc = build_did_document(&did, &dilithium_pk, &kyber_pk);
-    let dht_key = did.split(':').last().expect("invalid DID format").to_string();
+    let dht_key = did.split(':').next_back().expect("invalid DID format").to_string();
     let signed_record = build_signed_record(&did_doc, &dilithium_sk, "Dilithium-2");
 
     // Publish: set() returns None if the key exists or the signature is invalid.

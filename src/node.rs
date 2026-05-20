@@ -27,7 +27,12 @@ impl Node {
     /// Create a node with a known address.
     pub fn new(id: [u8; ID_LEN], ip: Option<String>, port: Option<u16>) -> Self {
         let long_id = Self::id_to_u128(&id);
-        Self { id, ip, port, long_id }
+        Self {
+            id,
+            ip,
+            port,
+            long_id,
+        }
     }
 
     /// Create a node without an address (used as a lookup key).
@@ -76,12 +81,14 @@ impl Node {
 
 impl fmt::Display for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}:{}",
-            self.ip.as_deref().unwrap_or("None"),
-            self.port.map_or_else(|| "None".to_string(), |p| p.to_string())
-        )
+        match (&self.ip, self.port) {
+            (Some(ip), Some(port)) => write!(f, "{}:{}", ip, port),
+            _ => {
+                // Key-space target node (no address) — show first 8 bytes of ID as hex.
+                let hex: String = self.id[..8].iter().map(|b| format!("{:02x}", b)).collect();
+                write!(f, "<key:{}>", hex)
+            }
+        }
     }
 }
 
@@ -119,7 +126,6 @@ impl Ord for HeapEntry {
     }
 }
 
-
 /// A bounded min-heap of nodes ordered by XOR distance from a pivot node.
 ///
 /// Kademlia lookups maintain a heap of the `k` closest known nodes. This
@@ -146,7 +152,6 @@ impl NodeHeap {
             maxsize,
         }
     }
-
 
     /// Insert a batch of nodes, ignoring duplicates.
     ///
@@ -179,7 +184,6 @@ impl NodeHeap {
         self.heap = entries.into_iter().collect();
     }
 
-
     /// Remove nodes by ID.
     pub fn remove(&mut self, peers: &[[u8; ID_LEN]]) {
         if peers.is_empty() {
@@ -198,7 +202,6 @@ impl NodeHeap {
     pub fn popleft(&mut self) -> Option<Node> {
         self.heap.pop().map(|e| e.node)
     }
-
 
     /// Return `true` if the node is already in the heap.
     pub fn contains(&self, node: &Node) -> bool {
@@ -232,7 +235,6 @@ impl NodeHeap {
         self.heap.is_empty()
     }
 
-
     /// Mark a node as contacted so it is excluded from future crawl rounds.
     pub fn mark_contacted(&mut self, node: &Node) {
         self.contacted.insert(node.id);
@@ -244,7 +246,6 @@ impl NodeHeap {
             .filter(|n| !self.contacted.contains(&n.id))
             .collect()
     }
-
 
     /// Iterate over nodes in ascending XOR-distance order, limited to `maxsize`.
     pub fn iter(&self) -> impl Iterator<Item = Node> + '_ {

@@ -32,14 +32,15 @@ use tokio::time::{sleep, Duration};
 
 use common::{build_did_document, build_signed_record, generate_did_iiot, start_node};
 
-
 /// Two nodes bootstrap from each other and end up in each other's routing table.
 #[tokio::test]
 async fn test_two_node_bootstrap_discover_each_other() {
     let _node1 = start_node(15700).await;
     let node2 = start_node(15701).await;
 
-    let discovered = node2.bootstrap(vec![("127.0.0.1".to_string(), 15700)]).await;
+    let discovered = node2
+        .bootstrap(vec![("127.0.0.1".to_string(), 15700)])
+        .await;
 
     // After bootstrap, node2 should have discovered node1 (and possibly itself).
     assert!(
@@ -55,8 +56,6 @@ async fn test_two_node_bootstrap_discover_each_other() {
     );
 }
 
-
-
 /// Node A stores a signed DID record; Node B retrieves it.
 /// This is the primary use case described in the README.
 #[tokio::test]
@@ -65,7 +64,9 @@ async fn test_set_on_node_a_and_get_from_node_b() {
     let node_b = start_node(15711).await;
 
     // Bootstrap so both nodes are aware of each other.
-    node_b.bootstrap(vec![("127.0.0.1".to_string(), 15710)]).await;
+    node_b
+        .bootstrap(vec![("127.0.0.1".to_string(), 15710)])
+        .await;
     sleep(Duration::from_millis(200)).await;
 
     // Build a valid signed DID record.
@@ -73,7 +74,7 @@ async fn test_set_on_node_a_and_get_from_node_b() {
     let (kpk, _) = kyber512::keypair();
     let did = generate_did_iiot();
     let doc = build_did_document(&did, &dpk, &kpk);
-    let key = did.split(':').last().unwrap().to_string();
+    let key = did.split(':').next_back().unwrap().to_string();
     let record = build_signed_record(&doc, &dsk, "Dilithium-2");
 
     // Node A publishes the record.
@@ -85,7 +86,10 @@ async fn test_set_on_node_a_and_get_from_node_b() {
 
     // Node B retrieves it — may come from node_a via the network.
     let retrieved = node_b.get(&key).await;
-    assert!(retrieved.is_some(), "Node B should be able to retrieve the record stored by Node A");
+    assert!(
+        retrieved.is_some(),
+        "Node B should be able to retrieve the record stored by Node A"
+    );
 
     // Verify the retrieved bytes match what was stored.
     assert_eq!(retrieved.unwrap(), record);
@@ -93,21 +97,21 @@ async fn test_set_on_node_a_and_get_from_node_b() {
     node_a.stop().await;
 }
 
-
-
 /// `set` on a key that already exists returns `None` (immutable records).
 #[tokio::test]
 async fn test_set_duplicate_key_rejected() {
     let mut node = start_node(15720).await;
     let node_b = start_node(15721).await;
-    node_b.bootstrap(vec![("127.0.0.1".to_string(), 15720)]).await;
+    node_b
+        .bootstrap(vec![("127.0.0.1".to_string(), 15720)])
+        .await;
     sleep(Duration::from_millis(200)).await;
 
     let (dpk, dsk) = dilithium2::keypair();
     let (kpk, _) = kyber512::keypair();
     let did = generate_did_iiot();
     let doc = build_did_document(&did, &dpk, &kpk);
-    let key = did.split(':').last().unwrap().to_string();
+    let key = did.split(':').next_back().unwrap().to_string();
     let record = build_signed_record(&doc, &dsk, "Dilithium-2");
 
     // First set must succeed.
@@ -124,8 +128,6 @@ async fn test_set_duplicate_key_rejected() {
     node.stop().await;
 }
 
-
-
 /// A DID owner rotates their key using the `update` operation:
 ///   1. Store old record (signed with old keypair).
 ///   2. Build new record (signed with new keypair).
@@ -137,15 +139,19 @@ async fn test_update_did_record_key_rotation() {
     let mut node2 = start_node(15731).await;
     let mut node3 = start_node(15732).await;
 
-    node2.bootstrap(vec![("127.0.0.1".to_string(), 15730)]).await;
-    node3.bootstrap(vec![("127.0.0.1".to_string(), 15730)]).await;
+    node2
+        .bootstrap(vec![("127.0.0.1".to_string(), 15730)])
+        .await;
+    node3
+        .bootstrap(vec![("127.0.0.1".to_string(), 15730)])
+        .await;
     sleep(Duration::from_millis(300)).await;
 
     // ── Step 1: generate old keypair and publish original record ──────────────
     let (old_pk, old_sk) = dilithium2::keypair();
     let (kpk, _) = kyber512::keypair();
     let did = generate_did_iiot();
-    let key = did.split(':').last().unwrap().to_string();
+    let key = did.split(':').next_back().unwrap().to_string();
     let old_doc = build_did_document(&did, &old_pk, &kpk);
     let old_record = build_signed_record(&old_doc, &old_sk, "Dilithium-2");
 
@@ -165,10 +171,7 @@ async fn test_update_did_record_key_rotation() {
 
     // ── Step 4: update via node3 ──────────────────────────────────────────────
     let updated = node3.update(&key, new_record.clone(), Some(auth_sig)).await;
-    assert!(
-        updated.unwrap_or(false),
-        "key-rotation update must succeed"
-    );
+    assert!(updated.unwrap_or(false), "key-rotation update must succeed");
 
     // ── Step 5: all nodes must return the NEW record ─────────────────────────
     // Give the network a moment to propagate the update.
@@ -176,20 +179,32 @@ async fn test_update_did_record_key_rotation() {
 
     // node1 — neutral observer, verifies network-wide propagation.
     let from_node1 = node1.get(&key).await;
-    assert!(from_node1.is_some(), "node1 must return the new record after update");
-    assert_eq!(from_node1.unwrap(), new_record, "node1: retrieved record must match the new record");
+    assert!(
+        from_node1.is_some(),
+        "node1 must return the new record after update"
+    );
+    assert_eq!(
+        from_node1.unwrap(),
+        new_record,
+        "node1: retrieved record must match the new record"
+    );
 
     // node2 — original storing node; must no longer serve the old record.
     let from_node2 = node2.get(&key).await;
-    assert!(from_node2.is_some(), "node2 must return the new record after update");
-    assert_eq!(from_node2.unwrap(), new_record, "node2: old record must be replaced by the new one");
+    assert!(
+        from_node2.is_some(),
+        "node2 must return the new record after update"
+    );
+    assert_eq!(
+        from_node2.unwrap(),
+        new_record,
+        "node2: old record must be replaced by the new one"
+    );
 
     node1.stop().await;
     node2.stop().await;
     node3.stop().await;
 }
-
-
 
 /// A DID owner deletes their record by signing a delete message with their key.
 /// After deletion, `get` returns None.
@@ -198,19 +213,24 @@ async fn test_delete_did_record() {
     let mut node1 = start_node(15740).await;
     let node2 = start_node(15741).await;
 
-    node2.bootstrap(vec![("127.0.0.1".to_string(), 15740)]).await;
+    node2
+        .bootstrap(vec![("127.0.0.1".to_string(), 15740)])
+        .await;
     sleep(Duration::from_millis(500)).await;
 
     // Store a record.
     let (pk, sk) = dilithium2::keypair();
     let (kpk, _) = kyber512::keypair();
     let did = generate_did_iiot();
-    let key = did.split(':').last().unwrap().to_string();
+    let key = did.split(':').next_back().unwrap().to_string();
     let doc = build_did_document(&did, &pk, &kpk);
     let record = build_signed_record(&doc, &sk, "Dilithium-2");
 
     let stored = node1.set(&key, record.clone()).await;
-    assert!(stored.unwrap_or(false), "store must succeed before delete test");
+    assert!(
+        stored.unwrap_or(false),
+        "store must succeed before delete test"
+    );
     sleep(Duration::from_millis(500)).await;
 
     // Build and sign the delete message.
@@ -219,9 +239,7 @@ async fn test_delete_did_record() {
     let del_sig = del_sig_ds.as_bytes().to_vec();
 
     // Node2 requests the delete.
-    let deleted = node2
-        .delete(&key, del_sig, delete_msg.to_vec())
-        .await;
+    let deleted = node2.delete(&key, del_sig, delete_msg.to_vec()).await;
     assert!(
         deleted.unwrap_or(false),
         "authenticated delete must succeed"
@@ -238,7 +256,6 @@ async fn test_delete_did_record() {
     node1.stop().await;
 }
 
-
 /// A record whose embedded signature does not match the public key in the
 /// DID Document must be rejected by `set` (returns None).
 #[tokio::test]
@@ -249,7 +266,7 @@ async fn test_invalid_signature_record_rejected_on_set() {
     let (_, wrong_sk) = dilithium2::keypair(); // different secret key — mismatch!
     let (kpk, _) = kyber512::keypair();
     let did = generate_did_iiot();
-    let key = did.split(':').last().unwrap().to_string();
+    let key = did.split(':').next_back().unwrap().to_string();
 
     // Build a record: DID Doc embeds `pk` (key A's public key) but the
     // signature is produced with `wrong_sk` (key B's secret key).
@@ -265,8 +282,6 @@ async fn test_invalid_signature_record_rejected_on_set() {
     node.stop().await;
 }
 
-
-
 /// Bootstrapping against an address where no node is listening returns an
 /// empty discovered list gracefully (no panic, no hang).
 #[tokio::test]
@@ -274,17 +289,13 @@ async fn test_bootstrap_unreachable_peer_returns_empty() {
     let node = start_node(15760).await;
 
     // Port 15799 has no listener.
-    let discovered = node
-        .bootstrap(vec![("127.0.0.1".to_string(), 15799)])
-        .await;
+    let discovered = node.bootstrap(vec![("127.0.0.1".to_string(), 15799)]).await;
 
     assert!(
         discovered.is_empty(),
         "bootstrap against an unreachable peer must return an empty list"
     );
 }
-
-
 
 /// `update` must return None when the submitted new record has a valid
 /// auth_signature (proving ownership of the old key) but an invalid
@@ -296,14 +307,16 @@ async fn test_update_rejected_when_new_record_self_sig_invalid() {
     let mut node1 = start_node(15780).await;
     let node2 = start_node(15781).await;
 
-    node2.bootstrap(vec![("127.0.0.1".to_string(), 15780)]).await;
+    node2
+        .bootstrap(vec![("127.0.0.1".to_string(), 15780)])
+        .await;
     sleep(Duration::from_millis(200)).await;
 
     // Store a valid original record on node1.
     let (old_pk, old_sk) = dilithium2::keypair();
     let (kpk, _) = kyber512::keypair();
     let did = generate_did_iiot();
-    let key = did.split(':').last().unwrap().to_string();
+    let key = did.split(':').next_back().unwrap().to_string();
     let old_doc = build_did_document(&did, &old_pk, &kpk);
     let old_record = build_signed_record(&old_doc, &old_sk, "Dilithium-2");
 
@@ -357,15 +370,19 @@ async fn test_update_rejected_when_auth_signature_uses_wrong_key() {
     let node2 = start_node(15783).await;
     let mut node3 = start_node(15784).await;
 
-    node2.bootstrap(vec![("127.0.0.1".to_string(), 15782)]).await;
-    node3.bootstrap(vec![("127.0.0.1".to_string(), 15782)]).await;
+    node2
+        .bootstrap(vec![("127.0.0.1".to_string(), 15782)])
+        .await;
+    node3
+        .bootstrap(vec![("127.0.0.1".to_string(), 15782)])
+        .await;
     sleep(Duration::from_millis(300)).await;
 
     // Store valid original record.
     let (old_pk, old_sk) = dilithium2::keypair();
     let (kpk, _) = kyber512::keypair();
     let did = generate_did_iiot();
-    let key = did.split(':').last().unwrap().to_string();
+    let key = did.split(':').next_back().unwrap().to_string();
     let old_doc = build_did_document(&did, &old_pk, &kpk);
     let old_record = build_signed_record(&old_doc, &old_sk, "Dilithium-2");
 
@@ -386,13 +403,23 @@ async fn test_update_rejected_when_auth_signature_uses_wrong_key() {
 
     // Update via node3 must be rejected.
     let result = node3.update(&key, new_record, Some(bad_auth_sig)).await;
-    assert!(result.is_none(), "update with wrong auth_sig must return None");
+    assert!(
+        result.is_none(),
+        "update with wrong auth_sig must return None"
+    );
 
     // Original record must still be retrievable from a neutral node.
     sleep(Duration::from_millis(200)).await;
     let still_there = node1.get(&key).await;
-    assert!(still_there.is_some(), "original record must survive a rejected update");
-    assert_eq!(still_there.unwrap(), old_record, "record content must be unchanged");
+    assert!(
+        still_there.is_some(),
+        "original record must survive a rejected update"
+    );
+    assert_eq!(
+        still_there.unwrap(),
+        old_record,
+        "record content must be unchanged"
+    );
 
     node1.stop().await;
     node3.stop().await;
@@ -409,14 +436,16 @@ async fn test_delete_rejected_when_signature_uses_wrong_key() {
     let mut node1 = start_node(15785).await;
     let node2 = start_node(15786).await;
 
-    node2.bootstrap(vec![("127.0.0.1".to_string(), 15785)]).await;
+    node2
+        .bootstrap(vec![("127.0.0.1".to_string(), 15785)])
+        .await;
     sleep(Duration::from_millis(200)).await;
 
     // Store a valid record on node1.
     let (pk, sk) = dilithium2::keypair();
     let (kpk, _) = kyber512::keypair();
     let did = generate_did_iiot();
-    let key = did.split(':').last().unwrap().to_string();
+    let key = did.split(':').next_back().unwrap().to_string();
     let doc = build_did_document(&did, &pk, &kpk);
     let record = build_signed_record(&doc, &sk, "Dilithium-2");
 
@@ -437,8 +466,15 @@ async fn test_delete_rejected_when_signature_uses_wrong_key() {
     // Record must still be retrievable after the rejected delete.
     sleep(Duration::from_millis(200)).await;
     let still_there = node1.get(&key).await;
-    assert!(still_there.is_some(), "record must survive a rejected delete");
-    assert_eq!(still_there.unwrap(), record, "record content must be unchanged");
+    assert!(
+        still_there.is_some(),
+        "record must survive a rejected delete"
+    );
+    assert_eq!(
+        still_there.unwrap(),
+        record,
+        "record content must be unchanged"
+    );
 
     node1.stop().await;
 }

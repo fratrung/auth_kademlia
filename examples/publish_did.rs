@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 /// Example: publish and retrieve a signed DID Document via auth_kademlia.
 ///
 /// Rust equivalent of the Python AuthKademlia example:
@@ -6,7 +7,7 @@
 ///   2. Generate Dilithium + Kyber key pairs
 ///   3. Build a did:iiot DID Document
 ///   4. Sign it and pack it into the record format:
-///        | algorithm (12 bytes, null-padded) | signature | DID Document (JSON) |
+///      | algorithm (12 bytes, null-padded) | signature | DID Document (JSON) |
 ///   5. Store the signed record in the DHT under the DID's UUID fragment
 ///   6. Retrieve and verify it
 ///
@@ -15,7 +16,6 @@
 ///
 /// If this is the first node in the network, omit --bootstrap.
 use std::sync::Arc;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use auth_kademlia_rs::auth_handler::DIDSignatureVerifierHandler;
@@ -29,8 +29,8 @@ use auth_kademlia_rs::network::Server;
 //   pqcrypto-traits    = "0.3"
 use pqcrypto_dilithium::dilithium2;
 use pqcrypto_kyber::kyber512;
-use pqcrypto_traits::sign::{PublicKey, DetachedSignature};
-use pqcrypto_traits::kem::{PublicKey as KemPublicKey};
+use pqcrypto_traits::kem::PublicKey as KemPublicKey;
+use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 
 // ─── Encoding / JSON ──────────────────────────────────────────────────────────
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -160,11 +160,13 @@ fn build_did_document(
 // Helper function to initialize and start a Kademlia node
 async fn start_node(port: u16) -> Server {
     // Initialize the signature handler with the issuer's public key
-    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
-        
+    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from(
+        "issuer.bin",
+    )));
+
     // Create a new Server: ksize=20, alpha=3
     let mut server = Server::new(handler, 20, 3, None, None);
-        
+
     // Start listening on the specified port
     server.listen(port, "127.0.0.1").await.unwrap();
     println!(">>> Node started on port {}", port);
@@ -173,51 +175,62 @@ async fn start_node(port: u16) -> Server {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    
     // Start two local nodes
     let node_1 = start_node(5678).await;
     let node_2 = start_node(5679).await;
 
     // Node 2 performs bootstrap toward Node 1 to join the network
     println!(">>> Node 2: Performing bootstrap towards Node 1 (5678)...");
-    let discovered = node_2.bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
-    
-    println!(">>> Node 2 discovered {} nodes during bootstrap", discovered.len());
-    
+    let discovered = node_2
+        .bootstrap(vec![("127.0.0.1".to_string(), 5678)])
+        .await;
+
+    println!(
+        ">>> Node 2 discovered {} nodes during bootstrap",
+        discovered.len()
+    );
+
     // Fallback logic if initial bootstrap fails
     if discovered.is_empty() {
         println!(">>> WARNING: Bootstrap failed, forcing manual retry...");
-        node_2.bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
+        node_2
+            .bootstrap(vec![("127.0.0.1".to_string(), 5678)])
+            .await;
     }
-    
+
     // Allow some time for the DHT routing tables to update
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    node_2.bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
-    
+    node_2
+        .bootstrap(vec![("127.0.0.1".to_string(), 5678)])
+        .await;
+
     sleep(Duration::from_secs(1)).await;
 
     // --- Post-Quantum Cryptography Section ---
     // Generate PQC keypairs (Dilithium for signatures, Kyber for encryption)
     let (dilithium_pk, dilithium_sk) = dilithium2::keypair();
     let (kyber_pk, _) = kyber512::keypair();
-    
+
     // Create a unique Decentralized Identifier (DID)
     let did = generate_did_iiot();
     let did_doc = build_did_document(&did, &dilithium_pk, &kyber_pk);
-    
+
     // Extract the hash-part of the DID to use as the DHT key
-    let dht_key = did.split(':').last().unwrap().to_string();
+    let dht_key = did.split(':').next_back().unwrap().to_string();
 
     // Sign the DID Document using Dilithium-2
     let signed_record = build_signed_record(&did_doc, &dilithium_sk, "Dilithium-2");
-    
+
     // Retry loop to publish the record (waiting for network stabilization)
     let mut is_ready = false;
     for i in 0..10 {
         let success = node_2.set(&dht_key.clone(), signed_record.clone()).await;
-        
+
         if success == Some(true) {
-            println!(">>> Network stabilized and record published on attempt {}!", i + 1);
+            println!(
+                ">>> Network stabilized and record published on attempt {}!",
+                i + 1
+            );
             is_ready = true;
             break;
         }
@@ -236,20 +249,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match node_1.get(&dht_key).await {
         Some(record) => {
             println!(">>> Node 1: Record found! ({} bytes)", record.len());
-            
+
             // Parse the binary record: [Algorithm Name (12 bytes)] [Signature] [DID Document JSON]
             let alg_cow = String::from_utf8_lossy(&record[0..12]);
             let alg = alg_cow.trim_matches(char::from(0)); // Remove null padding
             let doc_start = 12 + dilithium2::signature_bytes();
             let doc_bytes = &record[doc_start..];
-            
+
             if let Ok(doc) = serde_json::from_slice::<Value>(doc_bytes) {
                 println!(">>> Analysis:");
                 println!("    - Algorithm: {}", alg);
                 println!("    - DID Document ID: {}", doc["id"]);
-                println!("    - Full JSON: {}", serde_json::to_string_pretty(&doc).unwrap());
+                println!(
+                    "    - Full JSON: {}",
+                    serde_json::to_string_pretty(&doc).unwrap()
+                );
             }
-        },
+        }
         None => println!(">>> Node 1: Record not found!"),
     }
 

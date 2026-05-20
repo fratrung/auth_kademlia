@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use pqcrypto_dilithium::dilithium2;
+use pqcrypto_kyber::kyber512;
 use pqcrypto_traits::kem::PublicKey as KemPublicKey;
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
-use pqcrypto_kyber::kyber512;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -129,10 +129,13 @@ pub fn build_did_document(
 /// Uses `issuer_pub_key.bin` as the issuer key path (only needed for
 /// status-list key — not for regular DID record operations).
 pub async fn start_node(port: u16) -> Server {
-    let handler = Arc::new(DIDSignatureVerifierHandler::new(
-        PathBuf::from("issuer_pub_key.bin"),
-    ));
+    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from(
+        "issuer_pub_key.bin",
+    )));
     let mut server = Server::new(handler, 20, 3, None, None);
-    server.listen(port, "127.0.0.1").await.expect("listen failed");
+    server
+        .listen(port, "127.0.0.1")
+        .await
+        .expect("listen failed");
     server
 }

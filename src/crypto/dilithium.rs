@@ -18,15 +18,15 @@
 ///
 /// Security level is inferred automatically from the key length,
 /// exactly as in the Python implementation.
-/// 
+///
 use pqcrypto_dilithium::{dilithium2, dilithium3, dilithium5};
 use pqcrypto_traits::sign::{
     DetachedSignature, PublicKey as PQPublicKey, SecretKey as PQSecretKey,
 };
 
 use crate::crypto::signature_verifier::{
-    dilithium_level_from_privkey_len, dilithium_level_from_pubkey_len, Signer,
-    SignatureVerifier, VerifierError,
+    dilithium_level_from_privkey_len, dilithium_level_from_pubkey_len, SignatureVerifier, Signer,
+    VerifierError,
 };
 
 pub struct DilithiumSignatureVerifier;

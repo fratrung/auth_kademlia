@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{ Mutex};
+use tokio::sync::Mutex;
 
 const FRAG_MAGIC: u32 = 0x4B41_4446; // "KADF"
 const FRAG_HEADER_LEN: usize = 4 + 4 + 2 + 2; // 12 bytes
@@ -92,7 +92,7 @@ pub fn encode_fragments(frag_id: u32, payload: &[u8]) -> Vec<Vec<u8>> {
         return vec![buf];
     }
 
-    let total = ((payload.len() + FRAG_CHUNK_SIZE - 1) / FRAG_CHUNK_SIZE) as u16;
+    let total = payload.len().div_ceil(FRAG_CHUNK_SIZE) as u16;
     let mut datagrams = Vec::with_capacity(total as usize);
 
     for (i, chunk) in payload.chunks(FRAG_CHUNK_SIZE).enumerate() {
@@ -130,6 +130,12 @@ pub fn parse_fragment(data: &[u8]) -> Option<(FragHeader, &[u8])> {
     if total == 0 || index >= total {
         return None;
     }
-    Some((FragHeader { frag_id, index, total }, &data[FRAG_HEADER_LEN..]))
+    Some((
+        FragHeader {
+            frag_id,
+            index,
+            total,
+        },
+        &data[FRAG_HEADER_LEN..],
+    ))
 }
-

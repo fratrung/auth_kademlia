@@ -11,7 +11,7 @@ private key.
 ```
 cargo build                          # library + dht_node binary
 cargo build --bin dht_node           # only the Docker entry point
-cargo test                           # all 126 tests
+cargo test                           # all 131 tests
 cargo test <name>                    # single test, e.g. test_delete_did_record
 RUST_LOG=debug cargo test -- --nocapture   # verbose output
 ```
@@ -28,7 +28,8 @@ maturin develop --features python
 | `src/network.rs` | Public `Server` API: `set/get/update/delete`, bootstrap, refresh loop |
 | `src/crawling.rs` | Iterative lookup — `NodeSpiderCrawl` (find nodes) + `ValueSpiderCrawl` (find value) |
 | `src/routing.rs` | Kademlia routing table + k-buckets (XOR distance, bucket splits) |
-| `src/storage.rs` | `ForgetfulStorage` — insertion-ordered TTL KV store (`IndexMap`) |
+| `src/storage.rs` | `ForgetfulStorage` — sharded concurrent TTL KV store (`DashMap`); lazy expiry on read |
+| `src/signature_cache.rs` | `SignatureCache` — moka bounded cache (SHA-256 key, TTL 1 h, 4096 entries) for Dilithium verification results |
 | `src/fragmentation.rs` | KADF fragmentation + reassembly (`encode_fragments`, `parse_fragment`, `ReassemblyMap`) |
 | `src/auth_handler.rs` | `SignatureVerifierHandler` trait + `DIDSignatureVerifierHandler` (DID record verification) |
 | `src/crypto/signature_verifier.rs` | `SignatureVerifier` trait, `resolve_alg_and_length()`, algorithm registry |
@@ -37,7 +38,7 @@ maturin develop --features python
 | `src/crypto/ed25519.rs` | Ed25519 verifier + signer |
 | `src/crypto/rsa.rs` | RSA verifier + signer |
 | `src/crypto/key_manager.rs` | `KeyManager` — keypair generation, storage, sign/verify helpers |
-| `src/node.rs` | `Node` struct, XOR distance, `from_id` |
+| `src/node.rs` | `Node` struct, XOR distance, `from_id`; `Display` shows `ip:port` for real peers, `<key:hex8>` for key-space targets |
 | `src/utils.rs` | `digest()` (SHA-1 → `[u8; 20]`), `digest_bytes()`, `ID_LEN = 20` |
 | `scripts/dht_node.rs` | Docker container entry point (`publisher` / `retriever` roles) |
 | `tests/common/mod.rs` | Shared test helpers: `start_node`, `build_did_document`, `build_signed_record`, `generate_did_iiot` |
@@ -80,6 +81,13 @@ entering the reassembly buffer to bound memory usage.
 
 All RPCs are serialised with `bincode` and framed with a `(msg_id: u32, is_request: bool, message)` envelope. Responses are correlated via `msg_id` through a `PendingMap`.
 
+## Concurrency model
+- `ForgetfulStorage` is `Arc<ForgetfulStorage>` (no outer `RwLock`). All `IStorage` methods take `&self`; internal synchronization via `DashMap` shards.
+- `rpc_store` uses `insert_if_absent` (DashMap `Entry` API) — atomic at shard level, closes the TOCTOU race between "does key exist?" and "write it".
+- All RPC handlers use `self: &Arc<Self>` receiver to enable `tokio::spawn` without cloning the full struct. `welcome_if_new` is always fire-and-forget.
+- UDP receive loop dispatches through `mpsc::channel(1024)` → 4 fixed workers. Backpressure is applied when the channel is full.
+- `SignatureCache` is keyed on `SHA-256(record_bytes)`. TTL 1 h, capacity 4096. Eviction = cache miss = full re-verification (never a security bypass).
+
 ## Key invariants
 - Records are **immutable after creation**: `rpc_store` rejects duplicate keys.
 - `set()` calls `get()` first — returns `None` if the key already exists.
@@ -100,9 +108,9 @@ All RPCs are serialised with `bincode` and framed with a `(msg_id: u32, is_reque
 | `tests/network_tests.rs` | 8 | Full multi-node integration tests (real UDP) |
 | `tests/crypto_tests.rs` | 27 | Crypto layer unit + DID handler unit tests |
 | `tests/routing_tests.rs` | 20 | Routing table unit tests |
-| `tests/storage_tests.rs` | 17 | `ForgetfulStorage` unit tests |
+| `tests/storage_tests.rs` | 17 | `ForgetfulStorage` unit tests (includes `insert_if_absent` cases) |
 | `tests/dht_integration.rs` | 1 | Legacy 3-node end-to-end scenario |
-| `src/**` (inline) | 53 | Module-level `#[test]` blocks |
+| `src/**` (inline) | 56 | Module-level `#[test]` blocks |
 
 All tests are network-clean (loopback only) and run in parallel without interference when port ranges are respected.
 

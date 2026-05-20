@@ -16,3 +16,4 @@ Cargo.lock
 .env/
 
 issuer.bin
+TASKS.md

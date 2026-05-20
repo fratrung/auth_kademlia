@@ -14,7 +14,6 @@ use log;
 use crate::node::{Node, NodeHeap};
 use crate::utils::ID_LEN;
 
-
 /// Raw tuple returned by a protocol `call_find_*` method:
 /// `(response_received, payload)`.
 #[derive(Debug, Clone)]
@@ -76,7 +75,6 @@ impl RPCFindResponse {
     }
 }
 
-
 /// The subset of the Kademlia protocol needed by the spider crawl.
 ///
 /// This trait is implemented by `KademliaProtocol` and can be mocked in tests.
@@ -101,16 +99,10 @@ pub struct SpiderCrawl<P: SpiderProtocol> {
 }
 
 impl<P: SpiderProtocol> SpiderCrawl<P> {
-    pub fn new(
-        protocol: Arc<P>,
-        node: Node,
-        peers: Vec<Node>,
-        ksize: usize,
-        alpha: usize,
-    ) -> Self {
+    pub fn new(protocol: Arc<P>, node: Node, peers: Vec<Node>, ksize: usize, alpha: usize) -> Self {
         let mut nearest = NodeHeap::new(node.clone(), ksize);
         log::info!(
-            "Creating spider crawl for {} with {} initial peers",
+            "Starting lookup for key {} with {} initial peers",
             node,
             peers.len()
         );
@@ -132,10 +124,7 @@ impl<P: SpiderProtocol> SpiderCrawl<P> {
     ///
     /// When the nearest set has not changed since the last round (convergence),
     /// *all* remaining uncontacted nodes are queried instead of just `alpha`.
-    pub async fn find_round<F, Fut>(
-        &mut self,
-        rpcmethod: F,
-    ) -> HashMap<[u8; ID_LEN], RawResponse>
+    pub async fn find_round<F, Fut>(&mut self, rpcmethod: F) -> HashMap<[u8; ID_LEN], RawResponse>
     where
         F: Fn(Arc<P>, Node, Node) -> Fut + Clone,
         Fut: std::future::Future<Output = RawResponse> + Send,
@@ -170,10 +159,7 @@ impl<P: SpiderProtocol> SpiderCrawl<P> {
             futs.push(async move { (id, f(proto, peer_clone, node_clone).await) });
         }
 
-        futures::future::join_all(futs)
-            .await
-            .into_iter()
-            .collect()
+        futures::future::join_all(futs).await.into_iter().collect()
     }
 }
 
@@ -187,13 +173,7 @@ pub struct ValueSpiderCrawl<P: SpiderProtocol> {
 }
 
 impl<P: SpiderProtocol + 'static> ValueSpiderCrawl<P> {
-    pub fn new(
-        protocol: Arc<P>,
-        node: Node,
-        peers: Vec<Node>,
-        ksize: usize,
-        alpha: usize,
-    ) -> Self {
+    pub fn new(protocol: Arc<P>, node: Node, peers: Vec<Node>, ksize: usize, alpha: usize) -> Self {
         let nearest_without_value = NodeHeap::new(node.clone(), 1);
         Self {
             base: SpiderCrawl::new(protocol, node, peers, ksize, alpha),
@@ -210,9 +190,9 @@ impl<P: SpiderProtocol + 'static> ValueSpiderCrawl<P> {
     async fn find_inner(mut self) -> Option<Vec<u8>> {
         let responses = self
             .base
-            .find_round(|proto, peer, node| async move {
-                proto.call_find_value(&peer, &node).await
-            })
+            .find_round(
+                |proto, peer, node| async move { proto.call_find_value(&peer, &node).await },
+            )
             .await;
         self.nodes_found(responses).await
     }
@@ -285,14 +265,10 @@ pub struct NodeSpiderCrawl<P: SpiderProtocol> {
 }
 
 impl<P: SpiderProtocol + 'static> NodeSpiderCrawl<P> {
-    pub fn new(
-        protocol: Arc<P>,
-        node: Node,
-        peers: Vec<Node>,
-        ksize: usize,
-        alpha: usize,
-    ) -> Self {
-        Self { base: SpiderCrawl::new(protocol, node, peers, ksize, alpha) }
+    pub fn new(protocol: Arc<P>, node: Node, peers: Vec<Node>, ksize: usize, alpha: usize) -> Self {
+        Self {
+            base: SpiderCrawl::new(protocol, node, peers, ksize, alpha),
+        }
     }
 
     /// Run the lookup and return the k closest nodes found.
@@ -304,18 +280,13 @@ impl<P: SpiderProtocol + 'static> NodeSpiderCrawl<P> {
     async fn find_inner(mut self) -> Vec<Node> {
         let responses = self
             .base
-            .find_round(|proto, peer, node| async move {
-                proto.call_find_node(&peer, &node).await
-            })
+            .find_round(|proto, peer, node| async move { proto.call_find_node(&peer, &node).await })
             .await;
         self.nodes_found(responses).await
     }
 
     #[async_recursion]
-    async fn nodes_found(
-        mut self,
-        responses: HashMap<[u8; ID_LEN], RawResponse>,
-    ) -> Vec<Node> {
+    async fn nodes_found(mut self, responses: HashMap<[u8; ID_LEN], RawResponse>) -> Vec<Node> {
         let mut to_remove: Vec<[u8; ID_LEN]> = vec![];
 
         for (peer_id, raw) in &responses {

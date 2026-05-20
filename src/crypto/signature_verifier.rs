@@ -1,5 +1,4 @@
 /// Base traits, error types, and algorithm registry for signature verification.
-
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -107,9 +106,18 @@ mod tests {
 
     #[test]
     fn resolve_dilithium_levels() {
-        assert_eq!(resolve_alg_and_length("Dilithium-2").unwrap(), ("Dilithium".into(), 2420));
-        assert_eq!(resolve_alg_and_length("Dilithium-3").unwrap(), ("Dilithium".into(), 3293));
-        assert_eq!(resolve_alg_and_length("Dilithium-5").unwrap(), ("Dilithium".into(), 4595));
+        assert_eq!(
+            resolve_alg_and_length("Dilithium-2").unwrap(),
+            ("Dilithium".into(), 2420)
+        );
+        assert_eq!(
+            resolve_alg_and_length("Dilithium-3").unwrap(),
+            ("Dilithium".into(), 3293)
+        );
+        assert_eq!(
+            resolve_alg_and_length("Dilithium-5").unwrap(),
+            ("Dilithium".into(), 4595)
+        );
     }
 
     #[test]

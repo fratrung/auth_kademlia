@@ -15,17 +15,16 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use pqcrypto_dilithium::{dilithium2, dilithium3, dilithium5};
-use pqcrypto_kyber::{kyber512, kyber768, kyber1024};
+use pqcrypto_kyber::{kyber1024, kyber512, kyber768};
 use pqcrypto_traits::kem::{PublicKey as KemPublicKey, SecretKey as KemSecretKey};
 use pqcrypto_traits::sign::{PublicKey as SignPublicKey, SecretKey as SignSecretKey};
 use thiserror::Error;
 
 use crate::crypto::dilithium::{DilithiumSignatureVerifier, DilithiumSigner};
 use crate::crypto::ed25519::{Ed25519SignatureVerifier, Ed25519Signer};
-use crate::crypto::signature_verifier::{Signer, SignatureVerifier, VerifierError};
-
+use crate::crypto::signature_verifier::{SignatureVerifier, Signer, VerifierError};
 
 #[derive(Debug, Error)]
 pub enum KeyManagerError {
@@ -45,7 +44,6 @@ pub enum KeyManagerError {
     Io(#[from] std::io::Error),
 }
 
-
 pub fn b64encode_key(key: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(key)
 }
@@ -53,7 +51,6 @@ pub fn b64encode_key(key: &[u8]) -> String {
 pub fn b64decode_key(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     URL_SAFE_NO_PAD.decode(s)
 }
-
 
 /// Abstract key manager — generate, persist, and retrieve key pairs.
 ///
@@ -78,7 +75,6 @@ pub trait KeyManager {
     fn get_jose_format(&self, public_key: &[u8]) -> HashMap<String, String>;
 }
 
-
 fn write_key(path: &PathBuf, data: &[u8]) -> Result<(), KeyManagerError> {
     fs::write(path, data)?;
     Ok(())
@@ -87,7 +83,6 @@ fn write_key(path: &PathBuf, data: &[u8]) -> Result<(), KeyManagerError> {
 fn read_key(path: &PathBuf, key_name: &str) -> Result<Vec<u8>, KeyManagerError> {
     fs::read(path).map_err(|_| KeyManagerError::NotFound(key_name.to_string()))
 }
-
 
 /// Key manager for CRYSTALS-Dilithium (post-quantum signature scheme).
 ///
@@ -103,7 +98,10 @@ impl DilithiumKeyManager {
     pub fn new(keys_dir: impl Into<PathBuf>, security_level: u8) -> Self {
         let keys_dir = keys_dir.into();
         fs::create_dir_all(&keys_dir).ok();
-        Self { keys_dir, security_level }
+        Self {
+            keys_dir,
+            security_level,
+        }
     }
 
     /// Sign `message` with `private_key`.
@@ -138,24 +136,38 @@ impl KeyManager for DilithiumKeyManager {
                 let (pk, sk) = dilithium5::keypair();
                 Ok((pk.as_bytes().to_vec(), sk.as_bytes().to_vec()))
             }
-            _ => Err(KeyManagerError::InvalidSecurityLevel(self.security_level as u32)),
+            _ => Err(KeyManagerError::InvalidSecurityLevel(
+                self.security_level as u32,
+            )),
         }
     }
 
     fn store_public_key(&self, key_name: &str, public_key: &[u8]) -> Result<(), KeyManagerError> {
-        write_key(&self.keys_dir.join(format!("{}.public", key_name)), public_key)
+        write_key(
+            &self.keys_dir.join(format!("{}.public", key_name)),
+            public_key,
+        )
     }
 
     fn store_private_key(&self, key_name: &str, private_key: &[u8]) -> Result<(), KeyManagerError> {
-        write_key(&self.keys_dir.join(format!("{}.private", key_name)), private_key)
+        write_key(
+            &self.keys_dir.join(format!("{}.private", key_name)),
+            private_key,
+        )
     }
 
     fn get_public_key(&self, key_name: &str) -> Result<Vec<u8>, KeyManagerError> {
-        read_key(&self.keys_dir.join(format!("{}.public", key_name)), key_name)
+        read_key(
+            &self.keys_dir.join(format!("{}.public", key_name)),
+            key_name,
+        )
     }
 
     fn get_private_key(&self, key_name: &str) -> Result<Vec<u8>, KeyManagerError> {
-        read_key(&self.keys_dir.join(format!("{}.private", key_name)), key_name)
+        read_key(
+            &self.keys_dir.join(format!("{}.private", key_name)),
+            key_name,
+        )
     }
 
     /// JWK format: `{"kty": "MLWE", "alg": "CRYDI<level>", "x": <base64url>}`.
@@ -167,7 +179,6 @@ impl KeyManager for DilithiumKeyManager {
         ])
     }
 }
-
 
 /// Key manager for CRYSTALS-Kyber (post-quantum KEM — key encapsulation).
 ///
@@ -183,7 +194,10 @@ impl KyberKeyManager {
     pub fn new(keys_dir: impl Into<PathBuf>, security_level: u16) -> Self {
         let keys_dir = keys_dir.into();
         fs::create_dir_all(&keys_dir).ok();
-        Self { keys_dir, security_level }
+        Self {
+            keys_dir,
+            security_level,
+        }
     }
 }
 
@@ -202,24 +216,38 @@ impl KeyManager for KyberKeyManager {
                 let (pk, sk) = kyber1024::keypair();
                 Ok((pk.as_bytes().to_vec(), sk.as_bytes().to_vec()))
             }
-            _ => Err(KeyManagerError::InvalidSecurityLevel(self.security_level as u32)),
+            _ => Err(KeyManagerError::InvalidSecurityLevel(
+                self.security_level as u32,
+            )),
         }
     }
 
     fn store_public_key(&self, key_name: &str, public_key: &[u8]) -> Result<(), KeyManagerError> {
-        write_key(&self.keys_dir.join(format!("{}.public", key_name)), public_key)
+        write_key(
+            &self.keys_dir.join(format!("{}.public", key_name)),
+            public_key,
+        )
     }
 
     fn store_private_key(&self, key_name: &str, private_key: &[u8]) -> Result<(), KeyManagerError> {
-        write_key(&self.keys_dir.join(format!("{}.private", key_name)), private_key)
+        write_key(
+            &self.keys_dir.join(format!("{}.private", key_name)),
+            private_key,
+        )
     }
 
     fn get_public_key(&self, key_name: &str) -> Result<Vec<u8>, KeyManagerError> {
-        read_key(&self.keys_dir.join(format!("{}.public", key_name)), key_name)
+        read_key(
+            &self.keys_dir.join(format!("{}.public", key_name)),
+            key_name,
+        )
     }
 
     fn get_private_key(&self, key_name: &str) -> Result<Vec<u8>, KeyManagerError> {
-        read_key(&self.keys_dir.join(format!("{}.private", key_name)), key_name)
+        read_key(
+            &self.keys_dir.join(format!("{}.private", key_name)),
+            key_name,
+        )
     }
 
     /// JWK format: `{"kty": "KEM", "alg": "KYBER<level>", "x": <base64url>}`.
@@ -231,7 +259,6 @@ impl KeyManager for KyberKeyManager {
         ])
     }
 }
-
 
 /// Key manager for Ed25519 (classical signature scheme).
 pub struct Ed25519KeyManager {
@@ -265,8 +292,8 @@ impl KeyManager for Ed25519KeyManager {
     /// Returns `(public_key [32 bytes], private_key_seed [32 bytes])`.
     fn generate_keypair(&self) -> Result<(Vec<u8>, Vec<u8>), KeyManagerError> {
         use ed25519_dalek::SigningKey;
-        use rand::RngCore;
         use rand::rngs::OsRng;
+        use rand::RngCore;
 
         let mut seed = [0u8; 32];
         OsRng.fill_bytes(&mut seed);
@@ -277,19 +304,31 @@ impl KeyManager for Ed25519KeyManager {
     }
 
     fn store_public_key(&self, key_name: &str, public_key: &[u8]) -> Result<(), KeyManagerError> {
-        write_key(&self.keys_dir.join(format!("{}.public", key_name)), public_key)
+        write_key(
+            &self.keys_dir.join(format!("{}.public", key_name)),
+            public_key,
+        )
     }
 
     fn store_private_key(&self, key_name: &str, private_key: &[u8]) -> Result<(), KeyManagerError> {
-        write_key(&self.keys_dir.join(format!("{}.private", key_name)), private_key)
+        write_key(
+            &self.keys_dir.join(format!("{}.private", key_name)),
+            private_key,
+        )
     }
 
     fn get_public_key(&self, key_name: &str) -> Result<Vec<u8>, KeyManagerError> {
-        read_key(&self.keys_dir.join(format!("{}.public", key_name)), key_name)
+        read_key(
+            &self.keys_dir.join(format!("{}.public", key_name)),
+            key_name,
+        )
     }
 
     fn get_private_key(&self, key_name: &str) -> Result<Vec<u8>, KeyManagerError> {
-        read_key(&self.keys_dir.join(format!("{}.private", key_name)), key_name)
+        read_key(
+            &self.keys_dir.join(format!("{}.private", key_name)),
+            key_name,
+        )
     }
 
     /// JWK format: `{"kty": "OKP", "crv": "Ed25519", "x": <base64url>}`.
@@ -301,7 +340,6 @@ impl KeyManager for Ed25519KeyManager {
         ])
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -316,9 +354,11 @@ mod tests {
 
     fn rand_suffix() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64
     }
-
 
     #[test]
     fn dilithium2_generate_store_retrieve() {
@@ -374,9 +414,11 @@ mod tests {
     #[test]
     fn dilithium_key_not_found_error() {
         let km = DilithiumKeyManager::new(tmp_dir(), 2);
-        assert!(matches!(km.get_public_key("nonexistent"), Err(KeyManagerError::NotFound(_))));
+        assert!(matches!(
+            km.get_public_key("nonexistent"),
+            Err(KeyManagerError::NotFound(_))
+        ));
     }
-
 
     #[test]
     fn kyber512_generate_store_retrieve() {
@@ -417,7 +459,6 @@ mod tests {
         assert_eq!(jose["alg"], "KYBER512");
         assert!(!jose["x"].is_empty());
     }
-
 
     #[test]
     fn ed25519_generate_store_retrieve() {

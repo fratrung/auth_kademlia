@@ -50,6 +50,8 @@ rsa                = { version = "0.9", features = ["sha2"] }
 
 # Data structures
 indexmap       = "2"
+dashmap        = "6"
+moka           = { version = "0.12", features = ["sync"] }
 
 # Error handling
 thiserror      = "1"
