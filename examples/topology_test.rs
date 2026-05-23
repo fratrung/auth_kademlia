@@ -36,7 +36,6 @@ use serde_json::{json, Value};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-
 /// First port of the 8-node cluster (15810–15817).
 const BASE_PORT: u16 = 15810;
 const NUM_NODES: usize = 30;
@@ -44,7 +43,6 @@ const NUM_NODES: usize = 30;
 
 const NUM_RECORDS: usize = 200;
 const OP_TIMEOUT: Duration = Duration::from_secs(10);
-
 
 fn base64url(pk: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(pk)
@@ -131,14 +129,17 @@ fn extract_doc(record: &[u8]) -> Option<serde_json::Value> {
     serde_json::from_slice(&record[doc_start..]).ok()
 }
 
-
 async fn start_node(port: u16, ksize: usize, alpha: usize) -> Arc<Server> {
-    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
+    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from(
+        "issuer.bin",
+    )));
     let mut server = Server::new(handler, ksize, alpha, None, None, true);
-    server.listen(port, "127.0.0.1").await.expect("listen failed");
+    server
+        .listen(port, "127.0.0.1")
+        .await
+        .expect("listen failed");
     Arc::new(server)
 }
-
 
 async fn print_topology(
     nodes: &[(Arc<Server>, u16)],
@@ -172,10 +173,7 @@ async fn print_topology(
 
     for (server, port) in nodes {
         let entries = server.storage.iter_all();
-        let keys: Vec<String> = entries
-            .iter()
-            .map(|(k, _)| hex::encode(k))
-            .collect();
+        let keys: Vec<String> = entries.iter().map(|(k, _)| hex::encode(k)).collect();
 
         println!("  Node :{port}  ({} records)", keys.len());
         if keys.is_empty() {
@@ -201,11 +199,7 @@ async fn print_topology(
     sorted_keys.sort_by_key(|(k, _)| k.as_str());
     for (key, holders) in &sorted_keys {
         let ports: Vec<String> = holders.iter().map(|p| p.to_string()).collect();
-        println!(
-            "  {key}  {:>6}  {}",
-            holders.len(),
-            ports.join(", ")
-        );
+        println!("  {key}  {:>6}  {}", holders.len(), ports.join(", "));
     }
     println!();
 
@@ -261,7 +255,10 @@ async fn main() {
     println!("╔══════════════════════════════════════════════╗");
     println!("║     AuthKademlia-RS  Topology Test           ║");
     println!("╚══════════════════════════════════════════════╝");
-    println!("  Nodes    : {NUM_NODES}  (ports {BASE_PORT}–{})", BASE_PORT + NUM_NODES as u16 - 1);
+    println!(
+        "  Nodes    : {NUM_NODES}  (ports {BASE_PORT}–{})",
+        BASE_PORT + NUM_NODES as u16 - 1
+    );
     println!("  k (ksize): {ksize}  → records stored on ≤{ksize} closest nodes");
     println!("  alpha    : {alpha}");
     println!("  Records  : {NUM_RECORDS}  published from random writers, read from random readers");
@@ -322,14 +319,19 @@ async fn main() {
             }
             other => {
                 set_fail += 1;
-                println!("  [{i:>2}] writer={writer_port}  key={}  SET ✗  {other:?}", &key[..8]);
+                println!(
+                    "  [{i:>2}] writer={writer_port}  key={}  SET ✗  {other:?}",
+                    &key[..8]
+                );
             }
         }
     }
     println!("\n  Published: {set_ok}/{NUM_RECORDS}  ({set_fail} failed)\n");
 
     println!("━━━ Phase 2: Retrieve Records ━━━━━━━━━━━━━━━━━━\n");
-    println!("  (reader is always a different node than the expected holder — forces DHT lookup)\n");
+    println!(
+        "  (reader is always a different node than the expected holder — forces DHT lookup)\n"
+    );
 
     let mut get_ok = 0usize;
     let mut get_fail = 0usize;
@@ -353,7 +355,8 @@ async fn main() {
                     get_ok += 1;
                     println!(
                         "  [{i:>2}] reader={reader_port}  key={}  GET ✓  ({:.1}ms)",
-                        &key[..8], ns as f64 / 1e6
+                        &key[..8],
+                        ns as f64 / 1e6
                     );
                 } else {
                     get_corrupt += 1;
@@ -367,7 +370,8 @@ async fn main() {
                 get_fail += 1;
                 println!(
                     "  [{i:>2}] reader={reader_port}  key={}  GET ✗  not found  ({:.1}ms)",
-                    &key[..8], ns as f64 / 1e6
+                    &key[..8],
+                    ns as f64 / 1e6
                 );
             }
             Err(_) => {
@@ -386,20 +390,29 @@ async fn main() {
 
     fn stats(v: &mut Vec<u64>) -> (f64, u64, u64, u64) {
         v.sort_unstable();
-        let avg = if v.is_empty() { 0.0 } else { v.iter().sum::<u64>() as f64 / v.len() as f64 };
+        let avg = if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<u64>() as f64 / v.len() as f64
+        };
         let p50 = percentile(v, 50.0);
         let p95 = percentile(v, 95.0);
         let max = *v.last().unwrap_or(&0);
         (avg, p50, p95, max)
     }
     fn percentile(sorted: &[u64], p: f64) -> u64 {
-        if sorted.is_empty() { return 0; }
+        if sorted.is_empty() {
+            return 0;
+        }
         let idx = ((sorted.len() as f64 * p / 100.0).ceil() as usize).saturating_sub(1);
         sorted[idx.min(sorted.len() - 1)]
     }
     fn fmt(ns: u64) -> String {
-        if ns < 1_000_000 { format!("{:.1}µs", ns as f64 / 1_000.0) }
-        else { format!("{:.1}ms", ns as f64 / 1_000_000.0) }
+        if ns < 1_000_000 {
+            format!("{:.1}µs", ns as f64 / 1_000.0)
+        } else {
+            format!("{:.1}ms", ns as f64 / 1_000_000.0)
+        }
     }
 
     let (sa, sp50, sp95, smax) = stats(&mut set_latencies);
@@ -408,8 +421,20 @@ async fn main() {
     println!("  ┌───────┬──────────┬──────────┬──────────┬──────────┐");
     println!("  │       │   avg    │   p50    │   p95    │   max    │");
     println!("  ├───────┼──────────┼──────────┼──────────┼──────────┤");
-    println!("  │ SET   │ {:>8} │ {:>8} │ {:>8} │ {:>8} │", fmt(sa as u64), fmt(sp50), fmt(sp95), fmt(smax));
-    println!("  │ GET   │ {:>8} │ {:>8} │ {:>8} │ {:>8} │", fmt(ga as u64), fmt(gp50), fmt(gp95), fmt(gmax));
+    println!(
+        "  │ SET   │ {:>8} │ {:>8} │ {:>8} │ {:>8} │",
+        fmt(sa as u64),
+        fmt(sp50),
+        fmt(sp95),
+        fmt(smax)
+    );
+    println!(
+        "  │ GET   │ {:>8} │ {:>8} │ {:>8} │ {:>8} │",
+        fmt(ga as u64),
+        fmt(gp50),
+        fmt(gp95),
+        fmt(gmax)
+    );
     println!("  └───────┴──────────┴──────────┴──────────┴──────────┘\n");
 
     // Build key→did_uri map and pick 3 sample records to show as full DID Documents

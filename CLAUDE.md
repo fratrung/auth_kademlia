@@ -92,13 +92,13 @@ All RPCs are serialised with `bincode` and framed with a `(msg_id: u32, is_reque
 - `ForgetfulStorage` is `Arc<ForgetfulStorage>` (no outer `RwLock`). All `IStorage` methods take `&self`; internal synchronization via `DashMap` shards.
 - `rpc_store` uses `insert_if_absent` (DashMap `Entry` API) — atomic at shard level, closes the TOCTOU race between "does key exist?" and "write it".
 - All RPC handlers use `self: &Arc<Self>` receiver to enable `tokio::spawn` without cloning the full struct. `welcome_if_new` is always fire-and-forget.
-- UDP receive loop dispatches through `mpsc::channel(1024)` → 4 fixed workers. Backpressure is applied when the channel is full.
+- UDP receive loop spawns one Tokio task per datagram. An `inflight` semaphore (capacity 1024) in `network.rs::listen()` bounds the number of tasks in flight: when full, the datagram is dropped (UDP-native backpressure — bounds memory under load). Responses take the fast path (no semaphore). Requests invoke `req_sem` (sized to `available_parallelism()`) only around the `spawn_blocking` crypto call, so fast RPCs (ping, find_node) are never gated.
 - `SignatureCache` is keyed on `SHA-256(record_bytes)`. TTL 1 h, capacity 4096 (moka TinyLFU). Eviction = cache miss = full re-verification (never a security bypass). On a cache miss the SHA-256 key is computed once via `compute_key()` and reused for both `get_by_key` and `insert_by_key` — never twice.
 - `welcome_if_new` replication uses two conditions (Kademlia §2.5, matches Python AuthKademlia): `new_node_close` (new node is XOR-closer than the farthest k-neighbor) AND `this_closest` (this node is closer than the nearest k-neighbor). Both must be true to replicate. Neighbors are computed before `add_contact` so the new node is excluded from comparisons.
 
 ## Key invariants
 - Records are **immutable after creation**: `rpc_store` rejects duplicate keys.
-- `set()` calls `get()` first — returns `None` if the key already exists.
+- `set()` performs a single `ValueSpiderCrawl` (FIND_VALUE): if a valid record is found the store is rejected; if not, the k-closest nodes returned by the crawl are reused directly for STORE, avoiding a second network traversal (Kademlia §2.3).
 - Updates require `auth_signature = sign(new_record_bytes, old_private_key)`.
   `verify_key_rotation()` checks: (1) auth_sig valid under old public key, (2) new record self-signed.
   **Downgrade attacks are impossible**: to submit `record_v1` as "new" when `record_v2`
@@ -153,6 +153,25 @@ Environment variables per container: `NODE_PORT`, `IS_SEED`, `BOOTSTRAP_ADDR`,
 3. Add the algorithm string + signature length to `resolve_alg_and_length()` in
    `src/crypto/signature_verifier.rs`.
 4. Add tests in `tests/crypto_tests.rs`.
+
+## Session continuity — RESUME_BEFORE_COMPACT.md
+
+When the conversation is approaching context limits and a `/compact` is imminent,
+write a file `RESUME_BEFORE_COMPACT.md` in the project root **before** the compact
+happens. This file lets the next context window pick up exactly where the session
+left off.
+
+The file must contain:
+1. **Current task** — what the user is working on right now, in one sentence.
+2. **Pending actions** — any commits not yet created, PRs not yet opened, commands
+   not yet run, open questions awaiting an answer.
+3. **Key decisions made this session** — non-obvious choices and why they were made
+   (architecture, algorithm, workaround). Skip anything obvious from the code.
+4. **Files changed** — list of modified files with one-line summaries of what changed.
+5. **Known issues / blockers** — anything broken, half-finished, or needing follow-up.
+
+Keep it concise (≤ 60 lines). The file is ephemeral: delete it once the first
+message of the new session confirms the context has been picked up.
 
 ## What NOT to do
 - Do not hold a `Mutex` lock across an `.await` — deadlock risk.

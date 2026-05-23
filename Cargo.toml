@@ -24,7 +24,6 @@ python = ["dep:pyo3", "pyo3/extension-module", "dep:pyo3-async-runtimes"]
 tokio          = { version = "1", features = ["full"] }
 futures        = "0.3"
 async-trait    = "0.1"
-async-recursion = "1"
 uuid               = { version = "1", features = ["v4"] }
 
 # Serialization

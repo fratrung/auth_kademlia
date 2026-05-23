@@ -96,7 +96,7 @@ impl KBucket {
         let mut low = KBucket::new(lo..=mid, self.ksize);
         let mut high = KBucket::new(mid + 1..=hi, self.ksize);
 
-        for n in self.nodes.into_iter().chain(self.replacement_nodes.into_iter()) {
+        for n in self.nodes.into_iter().chain(self.replacement_nodes) {
             if n.long_id <= mid {
                 low.add_node(n);
             } else {
@@ -197,7 +197,9 @@ impl RoutingTable {
             return None;
         }
         // §4.2: split if bucket covers local node OR if depth % 5 != 0.
-        if self.buckets[idx].covers(self.node.long_id) || self.buckets[idx].depth() % 5 != 0 {
+        if self.buckets[idx].covers(self.node.long_id)
+            || !self.buckets[idx].depth().is_multiple_of(5)
+        {
             self.split_bucket(idx);
             return self.insert(node);
         }

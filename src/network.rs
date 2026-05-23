@@ -19,9 +19,6 @@ use crate::utils::{digest, digest_bytes, ID_LEN};
 
 const STATUS_LIST_KEY: &str = "did:iiot:status-list";
 
-/// Number of parallel datagram workers in the UDP receive loop.
-const DATAGRAM_WORKERS: usize = 4;
-
 pub struct Server {
     pub ksize: usize,
     pub alpha: usize,
@@ -84,7 +81,12 @@ impl Server {
         }
     }
 
-    /// Bind to `interface:port` and start the UDP receive loop with a worker pool.
+    /// Bind to `interface:port` and start the UDP receive loop.
+    ///
+    /// Each datagram is handled in its own Tokio task. A semaphore caps the
+    /// number of tasks in flight: when the limit is reached the datagram is
+    /// dropped — UDP-native backpressure that bounds memory under load without
+    /// serialising any processing.
     pub async fn listen(&mut self, port: u16, interface: &str) -> tokio::io::Result<()> {
         let addr = format!("{}:{}", interface, port);
         let socket = Arc::new(UdpSocket::bind(&addr).await?);
@@ -100,23 +102,8 @@ impl Server {
         ));
         self.protocol = Some(Arc::clone(&protocol));
 
-        // Bounded channel + fixed worker pool to bound task explosion under burst load.
-        let (tx, rx) = tokio::sync::mpsc::channel::<(Vec<u8>, std::net::SocketAddr)>(1024);
-        let rx = Arc::new(tokio::sync::Mutex::new(rx));
-
-        for _ in 0..DATAGRAM_WORKERS {
-            let rx = Arc::clone(&rx);
-            let proto = Arc::clone(&protocol);
-            tokio::spawn(async move {
-                loop {
-                    let item = rx.lock().await.recv().await;
-                    match item {
-                        Some((data, peer)) => proto.handle_datagram(data, peer).await,
-                        None => break,
-                    }
-                }
-            });
-        }
+        const MAX_INFLIGHT: usize = 1024;
+        let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT));
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65_536];
@@ -124,8 +111,20 @@ impl Server {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, peer)) => {
                         let data = buf[..len].to_vec();
-                        if tx.send((data, peer)).await.is_err() {
-                            break;
+                        let proto = Arc::clone(&protocol);
+                        match Arc::clone(&inflight).try_acquire_owned() {
+                            Ok(permit) => {
+                                tokio::spawn(async move {
+                                    proto.handle_datagram(data, peer).await;
+                                    drop(permit);
+                                });
+                            }
+                            Err(_) => {
+                                log::warn!(
+                                    "Max in-flight datagrams reached — dropping from {}",
+                                    peer
+                                );
+                            }
                         }
                     }
                     Err(e) => log::error!("UDP recv error: {}", e),
@@ -216,7 +215,7 @@ impl Server {
         // This matches the paper (§4.4): "the requesting node verifies the
         // signature before accepting the record."
         if let Some(result) = self.storage.get(&dkey) {
-            return if self.verify_value(key, &result) {
+            return if self.verify_value(key, &result).await {
                 Some(result)
             } else {
                 None
@@ -235,7 +234,7 @@ impl Server {
             return None;
         }
 
-        let result: Option<Vec<u8>> = ValueSpiderCrawl::new(
+        let (result, _) = ValueSpiderCrawl::new(
             Arc::clone(proto),
             Node::from_id(dkey),
             nearest,
@@ -245,10 +244,52 @@ impl Server {
         .find()
         .await;
 
-        // Still verify values fetched from remote nodes (untrusted source).
         match result {
-            Some(v) if self.verify_value(key, &v) => Some(v),
+            Some(v) if self.verify_value(key, &v).await => Some(v),
             _ => None,
+        }
+    }
+
+    /// Used by `set()` only: performs a FIND_VALUE crawl and also returns the
+    /// k-closest nodes so they can be reused for the subsequent STORE without a
+    async fn check_exists_and_get_nodes(&self, key: &str) -> (bool, Vec<Node>) {
+        let dkey = digest(key);
+
+        if self.storage.get(&dkey).is_some() {
+            return (true, vec![]);
+        }
+
+        let proto = match self.protocol.as_ref() {
+            Some(p) => p,
+            None => return (false, vec![]),
+        };
+
+        let nearest: Vec<Node> = proto
+            .router
+            .read()
+            .await
+            .find_neighbors(&Node::from_id(dkey), None);
+        if nearest.is_empty() {
+            log::warn!("set({}): no known neighbours", key);
+            return (false, vec![]);
+        }
+
+        let (result, nodes) = ValueSpiderCrawl::new(
+            Arc::clone(proto),
+            Node::from_id(dkey),
+            nearest,
+            self.ksize,
+            self.alpha,
+        )
+        .find()
+        .await;
+
+        match result {
+            // Verify before trusting: an invalid signature means no legitimate
+            // record exists at this key — the nodes are still usable for STORE.
+            Some(v) if self.verify_value(key, &v).await => (true, vec![]),
+            Some(_) => (false, nodes), // Invalid Signature case, but returns nodes to store the right DID Documet
+            None => (false, nodes),
         }
     }
 
@@ -256,17 +297,18 @@ impl Server {
     ///
     /// Returns `None` if the key already exists or the signature is invalid.
     pub async fn set(&self, key: &str, value: Vec<u8>) -> Option<bool> {
-        if self.get(key).await.is_some() {
+        let (exists, nodes) = self.check_exists_and_get_nodes(key).await;
+        if exists {
             log::error!("set({}): record already exists", key);
             return None;
         }
-        if !self.verify_value(key, &value) {
+        if !self.verify_value(key, &value).await {
             log::error!("set({}): invalid signature", key);
             return None;
         }
         log::info!("set({}): publishing to network", key);
         let dkey = digest(key);
-        Some(self.set_digest(dkey, value).await)
+        Some(self.set_digest(dkey, value, nodes).await)
     }
 
     /// Update an existing record.
@@ -283,19 +325,23 @@ impl Server {
     ) -> Option<bool> {
         let old_value = self.get(key).await?;
 
-        let ok = if key == STATUS_LIST_KEY && auth_signature.is_none() {
-            self.signature_handler
-                .handle_issuer_node_signature_verification(&value)
-                .unwrap_or(false)
-        } else {
-            self.signature_handler
-                .handle_update_verification(
-                    &value,
-                    &old_value,
-                    auth_signature.as_deref().unwrap_or_default(),
-                )
-                .unwrap_or(false)
-        };
+        let handler = Arc::clone(&self.signature_handler);
+        let is_status = key == STATUS_LIST_KEY && auth_signature.is_none();
+        let v = value.clone();
+        let auth = auth_signature.clone();
+        let ok = tokio::task::spawn_blocking(move || {
+            if is_status {
+                handler
+                    .handle_issuer_node_signature_verification(&v)
+                    .unwrap_or(false)
+            } else {
+                handler
+                    .handle_update_verification(&v, &old_value, auth.as_deref().unwrap_or_default())
+                    .unwrap_or(false)
+            }
+        })
+        .await
+        .unwrap_or(false);
 
         if !ok {
             log::error!("update({}): unauthenticated", key);
@@ -318,10 +364,16 @@ impl Server {
     ) -> Option<bool> {
         let value = self.get(key).await?;
 
-        let ok = self
-            .signature_handler
-            .handle_signature_delete_operation(&value, &auth_signature, &delete_msg)
-            .unwrap_or(false);
+        let handler = Arc::clone(&self.signature_handler);
+        let auth_c = auth_signature.clone();
+        let msg_c = delete_msg.clone();
+        let ok = tokio::task::spawn_blocking(move || {
+            handler
+                .handle_signature_delete_operation(&value, &auth_c, &msg_c)
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
         if !ok {
             log::error!("delete({}): invalid signature", key);
             return None;
@@ -331,38 +383,21 @@ impl Server {
         Some(self.delete_digest(dkey, auth_signature, delete_msg).await)
     }
 
-    async fn set_digest(&self, dkey: [u8; ID_LEN], value: Vec<u8>) -> bool {
+    async fn set_digest(&self, dkey: [u8; ID_LEN], value: Vec<u8>, nodes: Vec<Node>) -> bool {
         let proto = match &self.protocol {
             Some(p) => p,
             None => return false,
         };
-        let node = Node::from_id(dkey);
-        let nearest = proto.router.read().await.find_neighbors(&node, None);
-        if nearest.is_empty() {
-            log::warn!("set_digest {}: routing table empty — no neighbours", hex::encode(dkey));
-            return false;
-        }
-
-        let nodes = NodeSpiderCrawl::new(
-            Arc::clone(proto),
-            node.clone(),
-            nearest,
-            self.ksize,
-            self.alpha,
-        )
-        .find()
-        .await;
 
         if nodes.is_empty() {
-            log::warn!(
-                "set_digest {}: spider crawl returned 0 nodes (routing degraded)",
-                hex::encode(dkey)
-            );
+            log::warn!("set_digest {}: no nodes from lookup", hex::encode(dkey));
             return false;
         }
 
+        let node = Node::from_id(dkey);
+
         log::info!(
-            "set_digest {}: spider found {} nodes, issuing store RPCs",
+            "set_digest {}: storing on {} nodes",
             hex::encode(dkey),
             nodes.len()
         );
@@ -384,12 +419,17 @@ impl Server {
         let ok_count = results.iter().filter(|&&r| r).count();
         if ok_count == 0 {
             log::warn!(
-                "set_digest {}: all {} call_store_rpc returned false (nodes unreachable or rejected)",
+                "set_digest {}: all {} store RPCs failed",
                 hex::encode(dkey),
                 results.len()
             );
         } else {
-            log::info!("set_digest {}: {}/{} nodes acknowledged store", hex::encode(dkey), ok_count, results.len());
+            log::info!(
+                "set_digest {}: {}/{} nodes acknowledged store",
+                hex::encode(dkey),
+                ok_count,
+                results.len()
+            );
         }
         ok_count > 0
     }
@@ -498,43 +538,37 @@ impl Server {
         true
     }
 
-    fn verify_value(&self, key: &str, value: &[u8]) -> bool {
-        if let Some(cache) = &self.sig_cache {
-            let cache_key = SignatureCache::compute_key(value);
-            if let Some(cached) = cache.get_by_key(&cache_key) {
+    async fn verify_value(&self, key: &str, value: &[u8]) -> bool {
+        let is_status = key == STATUS_LIST_KEY;
+        let cache_key = self
+            .sig_cache
+            .as_ref()
+            .map(|_| SignatureCache::compute_key(value));
+        if let (Some(cache), Some(ck)) = (&self.sig_cache, &cache_key) {
+            if let Some(cached) = cache.get_by_key(ck) {
                 return cached;
             }
-            let result = if key == STATUS_LIST_KEY {
-                let ok = self
-                    .signature_handler
-                    .handle_issuer_node_signature_verification(value)
-                    .unwrap_or(false);
-                if ok {
-                    log::info!("Status-list signature verified");
-                }
-                ok
-            } else {
-                self.signature_handler
-                    .handle_signature_verification(value)
+        }
+        let handler = Arc::clone(&self.signature_handler);
+        let v = value.to_vec();
+        let result = tokio::task::spawn_blocking(move || {
+            if is_status {
+                handler
+                    .handle_issuer_node_signature_verification(&v)
                     .unwrap_or(false)
-            };
-            cache.insert_by_key(cache_key, result);
-            return result;
-        }
-        if key == STATUS_LIST_KEY {
-            let ok = self
-                .signature_handler
-                .handle_issuer_node_signature_verification(value)
-                .unwrap_or(false);
-            if ok {
-                log::info!("Status-list signature verified");
+            } else {
+                handler.handle_signature_verification(&v).unwrap_or(false)
             }
-            ok
-        } else {
-            self.signature_handler
-                .handle_signature_verification(value)
-                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        if result && is_status {
+            log::info!("Status-list signature verified");
         }
+        if let (Some(cache), Some(ck)) = (&self.sig_cache, cache_key) {
+            cache.insert_by_key(ck, result);
+        }
+        result
     }
 
     /// Return the addresses of bootstrappable neighbour nodes.

@@ -32,7 +32,7 @@ use pqcrypto_kyber::kyber512;
 use pqcrypto_traits::kem::PublicKey as KemPublicKey;
 use pqcrypto_traits::sign::PublicKey;
 use serde_json::{json, Value};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -46,17 +46,51 @@ const OP_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ─── Metrics ─────────────────────────────────────────────────────────────────
 
+/// Metrics collected in the main loop after each task completes.
+/// Plain values — no atomics, no mutexes, no Arc: the main task owns this
+/// exclusively and updates it sequentially as JoinSet futures resolve.
 #[derive(Default)]
-struct Metrics {
-    set_ok: AtomicUsize,
-    set_fail: AtomicUsize,
-    get_ok: AtomicUsize,
-    get_fail: AtomicUsize,
-    corruptions: AtomicUsize,
-    timeouts: AtomicUsize,
-    set_ns: Mutex<Vec<u64>>,
-    get_ns: Mutex<Vec<u64>>,
-    cache_hit_ns: Mutex<Vec<u64>>,
+struct Phase1Stats {
+    set_ok: usize,
+    set_fail: usize,
+    get_ok: usize,
+    get_fail: usize,
+    corruptions: usize,
+    timeouts: usize,
+    set_ns: Vec<u64>,
+    get_ns: Vec<u64>,
+    cache_ns: Vec<u64>,
+}
+
+impl Phase1Stats {
+    fn record(&mut self, result: Result<(u64, u64, u64, bool), &'static str>) {
+        match result {
+            Ok((s, g, c, corrupted)) => {
+                self.set_ok += 1;
+                self.get_ok += 1;
+                if corrupted {
+                    self.corruptions += 1;
+                }
+                self.set_ns.push(s);
+                self.get_ns.push(g);
+                self.cache_ns.push(c);
+            }
+            Err(e) if e.contains("timeout") => {
+                self.timeouts += 1;
+                if e.starts_with("set") {
+                    self.set_fail += 1;
+                } else {
+                    self.get_fail += 1;
+                }
+            }
+            Err(e) if e.starts_with("set") => {
+                self.set_fail += 1;
+            }
+            Err(_) => {
+                self.get_fail += 1;
+            }
+        }
+    }
 }
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
@@ -124,11 +158,7 @@ fn build_signed_record(doc: &Value, sk: &dilithium2::SecretKey) -> Vec<u8> {
     record
 }
 
-fn build_did_document(
-    did: &str,
-    dpk: &dilithium2::PublicKey,
-    kpk: &kyber512::PublicKey,
-) -> Value {
+fn build_did_document(did: &str, dpk: &dilithium2::PublicKey, kpk: &kyber512::PublicKey) -> Value {
     json!({
         "@context": ["https://www.w3.org/ns/did/v1"],
         "id": did,
@@ -166,9 +196,14 @@ fn new_did() -> (String, String, Vec<u8>, dilithium2::SecretKey) {
 // ─── Node factory ─────────────────────────────────────────────────────────────
 
 async fn start_node(port: u16) -> Arc<Server> {
-    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
+    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from(
+        "issuer.bin",
+    )));
     let mut server = Server::new(handler, 20, 3, None, None, true);
-    server.listen(port, "127.0.0.1").await.expect("listen failed");
+    server
+        .listen(port, "127.0.0.1")
+        .await
+        .expect("listen failed");
     Arc::new(server)
 }
 
@@ -224,10 +259,18 @@ struct Check {
 
 impl Check {
     fn pass(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, passed: true, detail: detail.into() }
+        Self {
+            name,
+            passed: true,
+            detail: detail.into(),
+        }
     }
     fn fail(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, passed: false, detail: detail.into() }
+        Self {
+            name,
+            passed: false,
+            detail: detail.into(),
+        }
     }
 }
 
@@ -264,7 +307,10 @@ async fn run_security_checks(nodes: &[Arc<Server>]) -> Vec<Check> {
         // Server::set() calls verify_value() before set_digest → returns None on failure
         let ok = matches!(r, Ok(None));
         results.push(if ok {
-            Check::pass("Tampered signature rejected", "set() returned None (signature mismatch)")
+            Check::pass(
+                "Tampered signature rejected",
+                "set() returned None (signature mismatch)",
+            )
         } else {
             Check::fail(
                 "Tampered signature rejected",
@@ -288,7 +334,10 @@ async fn run_security_checks(nodes: &[Arc<Server>]) -> Vec<Check> {
         let r = timeout(OP_TIMEOUT, writer.set(&key, record)).await;
         let ok = matches!(r, Ok(None));
         results.push(if ok {
-            Check::pass("Wrong-signer rejected", "set() returned None (pubkey/privkey mismatch)")
+            Check::pass(
+                "Wrong-signer rejected",
+                "set() returned None (pubkey/privkey mismatch)",
+            )
         } else {
             Check::fail(
                 "Wrong-signer rejected",
@@ -327,7 +376,9 @@ async fn run_security_checks(nodes: &[Arc<Server>]) -> Vec<Check> {
             let diagnosis = match &first {
                 Err(_) => "timeout",
                 Ok(None) => "None — signature invalid (bug in test setup)",
-                Ok(Some(false)) => "Some(false) — routing degraded, spider crawl found no reachable nodes",
+                Ok(Some(false)) => {
+                    "Some(false) — routing degraded, spider crawl found no reachable nodes"
+                }
                 _ => "unexpected",
             };
             results.push(Check::fail(
@@ -345,7 +396,10 @@ async fn run_security_checks(nodes: &[Arc<Server>]) -> Vec<Check> {
             let second = timeout(OP_TIMEOUT, writer.set(&key, record2)).await;
             let ok = matches!(second, Ok(None));
             results.push(if ok {
-                Check::pass("Duplicate key rejected", "second set() returned None (key already exists)")
+                Check::pass(
+                    "Duplicate key rejected",
+                    "second set() returned None (key already exists)",
+                )
             } else {
                 Check::fail(
                     "Duplicate key rejected",
@@ -357,12 +411,17 @@ async fn run_security_checks(nodes: &[Arc<Server>]) -> Vec<Check> {
             let stored = timeout(OP_TIMEOUT, reader.get(&key)).await;
             let original_intact = matches!(&stored, Ok(Some(v)) if v == &record);
             results.push(if original_intact {
-                Check::pass("Duplicate key: original preserved", "get() returned original record unchanged")
+                Check::pass(
+                    "Duplicate key: original preserved",
+                    "get() returned original record unchanged",
+                )
             } else {
                 let diagnosis = match &stored {
                     Err(_) => "timeout — reader node unreachable",
                     Ok(None) => "None — record not found (routing degraded, not overwritten)",
-                    Ok(Some(_)) => "Some(wrong_bytes) — record bytes differ (actual integrity failure)",
+                    Ok(Some(_)) => {
+                        "Some(wrong_bytes) — record bytes differ (actual integrity failure)"
+                    }
                 };
                 Check::fail(
                     "Duplicate key: original preserved",
@@ -435,8 +494,14 @@ async fn run_security_checks(nodes: &[Arc<Server>]) -> Vec<Check> {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let num_ops: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_OPS);
-    let concurrency: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_CONCURRENCY);
+    let num_ops: usize = args
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_OPS);
+    let concurrency: usize = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CONCURRENCY);
 
     println!("╔══════════════════════════════════════════════╗");
     println!("║       AuthKademlia-RS  Stress Test           ║");
@@ -454,8 +519,12 @@ async fn main() {
     println!("ok");
 
     print!("Bootstrapping... ");
-    peer1.bootstrap(vec![("127.0.0.1".to_string(), SEED_PORT)]).await;
-    peer2.bootstrap(vec![("127.0.0.1".to_string(), SEED_PORT)]).await;
+    peer1
+        .bootstrap(vec![("127.0.0.1".to_string(), SEED_PORT)])
+        .await;
+    peer2
+        .bootstrap(vec![("127.0.0.1".to_string(), SEED_PORT)])
+        .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     println!("ok\n");
 
@@ -466,73 +535,79 @@ async fn main() {
     // ─────────────────────────────────────────────────────────────────────────
     println!("━━━ Phase 1: Performance ━━━━━━━━━━━━━━━━━━━━━━\n");
 
-    let metrics = Arc::new(Metrics::default());
-    let sem = Arc::new(Semaphore::new(concurrency));
-    let completed = Arc::new(AtomicUsize::new(0));
+    // Each task owns its inputs directly — no Arc<Metrics>, no Semaphore, no
+    // shared mutable state. The JoinSet drains tasks as they complete, keeping
+    // at most `concurrency` futures alive at any point. Memory usage is
+    // O(concurrency × task_size) instead of O(num_ops × task_size).
+    let mut stats = Phase1Stats {
+        set_ns: Vec::with_capacity(num_ops),
+        get_ns: Vec::with_capacity(num_ops),
+        cache_ns: Vec::with_capacity(num_ops),
+        ..Phase1Stats::default()
+    };
     let wall = Instant::now();
+    let mut completed = 0usize;
+    let step = (num_ops / 10).max(1);
 
-    let mut handles = Vec::with_capacity(num_ops);
+    let mut jset: JoinSet<Result<(u64, u64, u64, bool), &'static str>> = JoinSet::new();
+
     for i in 0..num_ops {
-        let permit = Arc::clone(&sem);
-        let m = Arc::clone(&metrics);
-        let done = Arc::clone(&completed);
-        let writer = Arc::clone(&nodes[i % nodes.len()]);
-        let reader = Arc::clone(&nodes[(i + 1) % nodes.len()]);
-
-        handles.push(tokio::spawn(async move {
-            let _guard = permit.acquire_owned().await.unwrap();
-            match stress_op(writer, reader).await {
-                Ok((set_ns, get_ns, cache_ns, corrupted)) => {
-                    m.set_ok.fetch_add(1, Ordering::Relaxed);
-                    m.get_ok.fetch_add(1, Ordering::Relaxed);
-                    if corrupted {
-                        m.corruptions.fetch_add(1, Ordering::Relaxed);
-                    }
-                    m.set_ns.lock().await.push(set_ns);
-                    m.get_ns.lock().await.push(get_ns);
-                    m.cache_hit_ns.lock().await.push(cache_ns);
+        // Before spawning the next task, drain completed ones until we are
+        // strictly below the concurrency limit.
+        while jset.len() >= concurrency {
+            match jset.join_next().await {
+                Some(Ok(result)) => stats.record(result),
+                Some(Err(e)) => {
+                    // A task panicked — should not happen, but handle it rather
+                    // than propagating the panic to the test runner.
+                    log::error!("stress op task panicked: {e}");
+                    stats.get_fail += 1;
                 }
-                Err(e) if e.contains("timeout") => {
-                    m.timeouts.fetch_add(1, Ordering::Relaxed);
-                    if e.starts_with("set") {
-                        m.set_fail.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        m.get_fail.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                Err(e) if e.starts_with("set") => {
-                    m.set_fail.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(_) => {
-                    m.get_fail.fetch_add(1, Ordering::Relaxed);
-                }
+                None => break, // set unexpectedly empty — safety net only
             }
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            let step = (num_ops / 10).max(1);
-            if n.is_multiple_of(step) || n == num_ops {
-                print!("\r  Progress: {n}/{num_ops}");
+            completed += 1;
+            if completed % step == 0 || completed == num_ops {
+                print!("\r  Progress: {completed}/{num_ops}");
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
-        }));
+        }
+
+        let writer = Arc::clone(&nodes[i % nodes.len()]);
+        let reader = Arc::clone(&nodes[(i + 1) % nodes.len()]);
+        jset.spawn(async move { stress_op(writer, reader).await });
     }
 
-    for h in handles {
-        let _ = h.await;
+    // Drain the tasks that are still in flight after all ops have been spawned.
+    while let Some(join_result) = jset.join_next().await {
+        match join_result {
+            Ok(result) => stats.record(result),
+            Err(e) => {
+                log::error!("stress op task panicked: {e}");
+                stats.get_fail += 1;
+            }
+        }
+        completed += 1;
+        if completed % step == 0 || completed == num_ops {
+            print!("\r  Progress: {completed}/{num_ops}");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
     }
+
     let elapsed = wall.elapsed();
     println!("\r  Progress: {num_ops}/{num_ops}  ✓\n");
 
-    let set_ok = metrics.set_ok.load(Ordering::Relaxed);
-    let set_fail = metrics.set_fail.load(Ordering::Relaxed);
-    let get_ok = metrics.get_ok.load(Ordering::Relaxed);
-    let get_fail = metrics.get_fail.load(Ordering::Relaxed);
-    let corruptions = metrics.corruptions.load(Ordering::Relaxed);
-    let timeouts = metrics.timeouts.load(Ordering::Relaxed);
+    let set_ok = stats.set_ok;
+    let set_fail = stats.set_fail;
+    let get_ok = stats.get_ok;
+    let get_fail = stats.get_fail;
+    let corruptions = stats.corruptions;
+    let timeouts = stats.timeouts;
 
-    let mut set_ns = metrics.set_ns.lock().await.clone();
-    let mut get_ns = metrics.get_ns.lock().await.clone();
-    let mut cache_ns = metrics.cache_hit_ns.lock().await.clone();
+    let mut set_ns = stats.set_ns;
+    let mut get_ns = stats.get_ns;
+    let mut cache_ns = stats.cache_ns;
     set_ns.sort_unstable();
     get_ns.sort_unstable();
     cache_ns.sort_unstable();
@@ -600,7 +675,9 @@ async fn main() {
     const SEC_PEER1_PORT: u16 = 15804;
     let sec_seed = start_node(SEC_SEED_PORT).await;
     let sec_peer = start_node(SEC_PEER1_PORT).await;
-    sec_peer.bootstrap(vec![("127.0.0.1".to_string(), SEC_SEED_PORT)]).await;
+    sec_peer
+        .bootstrap(vec![("127.0.0.1".to_string(), SEC_SEED_PORT)])
+        .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let sec_nodes: Vec<Arc<Server>> = vec![sec_seed, sec_peer];
     println!("  ok\n");
@@ -633,7 +710,10 @@ async fn main() {
             eprintln!("  RESULT: DATA INTEGRITY FAILURE ({corruptions} corruptions)");
         }
         if !security_ok {
-            eprintln!("  RESULT: SECURITY FAILURE ({}/{total} checks failed)", total - passed);
+            eprintln!(
+                "  RESULT: SECURITY FAILURE ({}/{total} checks failed)",
+                total - passed
+            );
         }
         std::process::exit(1);
     }

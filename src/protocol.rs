@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use log;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
-use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock, Semaphore};
 use tokio::time::timeout;
 
 use crate::auth_handler::SignatureVerifierHandler;
@@ -147,6 +147,9 @@ pub struct KademliaProtocol {
     next_msg_id: AtomicU32,
     next_frag_id: AtomicU32,
     reassembly: ReassemblyMap,
+    /// Limits concurrent Dilithium verifications to available CPU cores.
+    /// Acquired only inside spawn_blocking calls — fast RPCs (ping, find_node) never touch it.
+    req_sem: Arc<Semaphore>,
 }
 
 impl KademliaProtocol {
@@ -159,6 +162,9 @@ impl KademliaProtocol {
         sig_cache: Option<Arc<SignatureCache>>,
     ) -> Self {
         let router = RoutingTable::new(source_node.clone(), ksize);
+        let parallelism = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4);
         Self {
             router: Arc::new(RwLock::new(router)),
             storage,
@@ -170,6 +176,7 @@ impl KademliaProtocol {
             next_msg_id: AtomicU32::new(0),
             next_frag_id: AtomicU32::new(0),
             reassembly: Arc::new(Mutex::new(HashMap::new())),
+            req_sem: Arc::new(Semaphore::new(parallelism)),
         }
     }
 
@@ -252,6 +259,7 @@ impl KademliaProtocol {
             Ok(Ok(response)) => Some(response),
             Ok(Err(_)) => {
                 log::debug!("Response channel closed for msg_id={}", msg_id);
+                self.pending.lock().await.remove(&msg_id);
                 None
             }
             Err(_) => {
@@ -346,14 +354,13 @@ impl KademliaProtocol {
         };
 
         if !frame.is_request {
+            // Fast path: deliver response to the waiting call() immediately.
+            // No semaphore — this must never wait behind request processing.
             if let RpcMessage::Pong { sender_id } = &frame.message {
                 let source = Node::new(*sender_id, Some(peer.ip().to_string()), Some(peer.port()));
                 let p = Arc::clone(self);
-                tokio::spawn(async move {
-                    p.welcome_if_new(source).await;
-                });
+                tokio::spawn(async move { p.welcome_if_new(source).await });
             }
-
             if let Some(tx) = self.pending.lock().await.remove(&frame.msg_id) {
                 let _ = tx.send(frame.message);
             }
@@ -466,7 +473,7 @@ impl KademliaProtocol {
         key: [u8; ID_LEN],
         value: Vec<u8>,
     ) -> bool {
-        if !self.verify_for_key(&key, &value) {
+        if !self.verify_for_key(&key, &value).await {
             log::error!("rpc_store: invalid signature for {}", hex::encode(key));
             return false;
         }
@@ -496,10 +503,20 @@ impl KademliaProtocol {
                 return false;
             }
         };
-        let ok = self
-            .signature_handler
-            .handle_update_verification(&value, &old_value, &auth_signature)
-            .unwrap_or(false);
+        let handler = Arc::clone(&self.signature_handler);
+        let v = value.clone();
+        let ok = {
+            let Ok(_permit) = self.req_sem.acquire().await else {
+                return false;
+            };
+            tokio::task::spawn_blocking(move || {
+                handler
+                    .handle_update_verification(&v, &old_value, &auth_signature)
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false)
+        };
         if !ok {
             log::error!(
                 "rpc_update: unauthenticated update for {}",
@@ -528,10 +545,20 @@ impl KademliaProtocol {
             );
             return false;
         }
-        let ok = self
-            .signature_handler
-            .handle_issuer_node_signature_verification(&value)
-            .unwrap_or(false);
+        let handler = Arc::clone(&self.signature_handler);
+        let v = value.clone();
+        let ok = {
+            let Ok(_permit) = self.req_sem.acquire().await else {
+                return false;
+            };
+            tokio::task::spawn_blocking(move || {
+                handler
+                    .handle_issuer_node_signature_verification(&v)
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false)
+        };
         if !ok {
             log::error!("rpc_update_status_list: unauthenticated update");
             return false;
@@ -558,10 +585,19 @@ impl KademliaProtocol {
                 return false;
             }
         };
-        let ok = self
-            .signature_handler
-            .handle_signature_delete_operation(&value, &auth_signature, &delete_msg)
-            .unwrap_or(false);
+        let handler = Arc::clone(&self.signature_handler);
+        let ok = {
+            let Ok(_permit) = self.req_sem.acquire().await else {
+                return false;
+            };
+            tokio::task::spawn_blocking(move || {
+                handler
+                    .handle_signature_delete_operation(&value, &auth_signature, &delete_msg)
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false)
+        };
         if !ok {
             log::error!("rpc_delete: invalid signature for {}", hex::encode(key));
             return false;
@@ -591,25 +627,27 @@ impl KademliaProtocol {
     }
 
     pub async fn rpc_find_value(
-        self: &Arc<Self>,
-        sender_id: [u8; ID_LEN],
-        sender_addr: (String, u16),
-        key: [u8; ID_LEN],
-    ) -> FindValueResult {
-        // Python always calls welcome_if_new(source) unconditionally at the top of
-        // rpc_find_value, before checking storage. Mirror that here for both branches.
-        let source = Node::new(sender_id, Some(sender_addr.0.clone()), Some(sender_addr.1));
-        let p = Arc::clone(self);
-        tokio::spawn(async move { p.welcome_if_new(source).await });
+    self: &Arc<Self>,
+    sender_id: [u8; ID_LEN],
+    sender_addr: (String, u16),
+    key: [u8; ID_LEN],
+) -> FindValueResult {
+    let source = Node::new(sender_id, Some(sender_addr.0.clone()), Some(sender_addr.1));
 
-        match self.storage.get(&key) {
-            Some(v) => FindValueResult::Value(v),
-            None => {
-                let neighbors = self.rpc_find_node(sender_id, sender_addr, key).await;
-                FindValueResult::Nodes(neighbors)
-            }
+    self.welcome_if_new(source.clone()).await;
+
+    match self.storage.get(&key) {
+        Some(v) => FindValueResult::Value(v),
+        None => {
+            let target = Node::from_id(key);
+            let neighbors = self.router
+                .read()
+                .await
+                .find_neighbors(&target, Some(&source));
+            FindValueResult::Nodes(neighbors)
         }
     }
+}
 
     pub async fn rpc_leave(&self, sender_id: [u8; ID_LEN], sender_addr: (String, u16)) {
         log::info!("Node {} is leaving the network", hex::encode(sender_id));
@@ -656,10 +694,7 @@ impl KademliaProtocol {
             )
             .await
         {
-            Some(RpcMessage::StoreResult { ok }) => {
-                self.router.write().await.add_contact(peer.clone());
-                ok
-            }
+            Some(RpcMessage::StoreResult { ok }) => ok,
             _ => {
                 log::warn!("no response from {}, removing from router", peer);
                 self.router.write().await.remove_contact(peer);
@@ -695,10 +730,7 @@ impl KademliaProtocol {
             )
             .await
         {
-            Some(RpcMessage::UpdateResult { ok }) => {
-                self.router.write().await.add_contact(peer.clone());
-                ok
-            }
+            Some(RpcMessage::UpdateResult { ok }) => ok,
             _ => {
                 log::warn!("no response from {}, removing from router", peer);
                 self.router.write().await.remove_contact(peer);
@@ -732,10 +764,7 @@ impl KademliaProtocol {
             )
             .await
         {
-            Some(RpcMessage::UpdateStatusListResult { ok }) => {
-                self.router.write().await.add_contact(peer.clone());
-                ok
-            }
+            Some(RpcMessage::UpdateStatusListResult { ok }) => ok,
             _ => {
                 log::warn!("no response from {}, removing from router", peer);
                 self.router.write().await.remove_contact(peer);
@@ -771,10 +800,7 @@ impl KademliaProtocol {
             )
             .await
         {
-            Some(RpcMessage::DeleteResult { ok }) => {
-                self.router.write().await.add_contact(peer.clone());
-                ok
-            }
+            Some(RpcMessage::DeleteResult { ok }) => ok,
             _ => {
                 log::warn!("no response from {}, removing from router", peer);
                 self.router.write().await.remove_contact(peer);
@@ -805,34 +831,40 @@ impl KademliaProtocol {
 
     /// Verify `value` for `key`, using the signature cache to skip redundant
     /// PQ crypto on repeated calls with the same record bytes.
-    fn verify_for_key(&self, key: &[u8; ID_LEN], value: &[u8]) -> bool {
-        let status_list_key = digest(STATUS_LIST_KEY);
-        if let Some(cache) = &self.sig_cache {
-            let cache_key = SignatureCache::compute_key(value);
-            if let Some(cached) = cache.get_by_key(&cache_key) {
+    async fn verify_for_key(&self, key: &[u8; ID_LEN], value: &[u8]) -> bool {
+        let is_status = *key == digest(STATUS_LIST_KEY);
+        let cache_key = self
+            .sig_cache
+            .as_ref()
+            .map(|_| SignatureCache::compute_key(value));
+        if let (Some(cache), Some(ck)) = (&self.sig_cache, &cache_key) {
+            if let Some(cached) = cache.get_by_key(ck) {
                 return cached;
             }
-            let result = if *key == status_list_key {
-                self.signature_handler
-                    .handle_issuer_node_signature_verification(value)
-                    .unwrap_or(false)
-            } else {
-                self.signature_handler
-                    .handle_signature_verification(value)
-                    .unwrap_or(false)
+        }
+        let handler = Arc::clone(&self.signature_handler);
+        let v = value.to_vec();
+        let result = {
+            let Ok(_permit) = self.req_sem.acquire().await else {
+                return false;
             };
-            cache.insert_by_key(cache_key, result);
-            return result;
+            tokio::task::spawn_blocking(move || {
+                if is_status {
+                    handler
+                        .handle_issuer_node_signature_verification(&v)
+                        .unwrap_or(false)
+                } else {
+                    handler.handle_signature_verification(&v).unwrap_or(false)
+                }
+            })
+            .await
+            .unwrap_or(false)
+            // _permit dropped here — semaphore released as soon as Dilithium finishes
+        };
+        if let (Some(cache), Some(ck)) = (&self.sig_cache, cache_key) {
+            cache.insert_by_key(ck, result);
         }
-        if *key == status_list_key {
-            self.signature_handler
-                .handle_issuer_node_signature_verification(value)
-                .unwrap_or(false)
-        } else {
-            self.signature_handler
-                .handle_signature_verification(value)
-                .unwrap_or(false)
-        }
+        result
     }
 
     /// If `node` is new, add it to the routing table and replicate relevant

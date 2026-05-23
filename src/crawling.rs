@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_recursion::async_recursion;
 use log;
 
 use crate::node::{Node, NodeHeap};
@@ -134,7 +133,6 @@ impl<P: SpiderProtocol> SpiderCrawl<P> {
 
         let current_ids = self.nearest.get_ids();
         let count = if current_ids == self.last_ids_crawled {
-            // Converged: query everyone still uncontacted.
             self.nearest.len()
         } else {
             self.alpha
@@ -148,7 +146,6 @@ impl<P: SpiderProtocol> SpiderCrawl<P> {
             .take(count)
             .collect();
 
-        // Fire all RPCs concurrently.
         let mut futs: Vec<_> = Vec::with_capacity(uncontacted.len());
         for peer in &uncontacted {
             self.nearest.mark_contacted(peer);
@@ -182,81 +179,67 @@ impl<P: SpiderProtocol + 'static> ValueSpiderCrawl<P> {
         }
     }
 
-    /// Run the lookup and return the value if found.
-    pub async fn find(self) -> Option<Vec<u8>> {
-        self.find_inner().await
-    }
+    /// Run the lookup. Returns the found value and the k-closest nodes discovered.
+    ///
+    /// On a value hit: `(Some(value), vec![])`.
+    /// On a miss: `(None, k_closest)` — the caller can use the nodes directly
+    /// for a subsequent STORE without a second traversal (Kademlia §2.3).
+    pub async fn find(mut self) -> (Option<Vec<u8>>, Vec<Node>) {
+        loop {
+            let responses = self
+                .base
+                .find_round(
+                    |proto, peer, node| async move { proto.call_find_value(peer, node).await },
+                )
+                .await;
 
-    #[async_recursion]
-    async fn find_inner(mut self) -> Option<Vec<u8>> {
-        let responses = self
-            .base
-            .find_round(
-                |proto, peer, node| async move { proto.call_find_value(peer, node).await },
-            )
-            .await;
-        self.nodes_found(responses).await
-    }
+            let mut to_remove: Vec<[u8; ID_LEN]> = vec![];
+            let mut found_values: Vec<Vec<u8>> = vec![];
 
-    #[async_recursion]
-    async fn nodes_found(
-        mut self,
-        responses: HashMap<[u8; ID_LEN], RawResponse>,
-    ) -> Option<Vec<u8>> {
-        let mut to_remove: Vec<[u8; ID_LEN]> = vec![];
-        let mut found_values: Vec<Vec<u8>> = vec![];
-
-        for (peer_id, raw) in &responses {
-            let r = RPCFindResponse::new(raw.clone());
-            if !r.happened() {
-                to_remove.push(*peer_id);
-            } else if r.has_value() {
-                if let Some(v) = r.get_value() {
-                    found_values.push(v);
+            for (peer_id, raw) in &responses {
+                let r = RPCFindResponse::new(raw.clone());
+                if !r.happened() {
+                    to_remove.push(*peer_id);
+                } else if r.has_value() {
+                    if let Some(v) = r.get_value() {
+                        found_values.push(v);
+                    }
+                } else {
+                    if let Some(peer) = self.base.nearest.get_node(peer_id) {
+                        self.nearest_without_value.push_one(peer);
+                    }
+                    self.base.nearest.push(r.get_node_list());
                 }
-            } else {
-                // The peer didn't have the value — record it for caching later.
-                if let Some(peer) = self.base.nearest.get_node(peer_id) {
-                    self.nearest_without_value.push_one(peer);
+            }
+            self.base.nearest.remove(&to_remove);
+
+            if !found_values.is_empty() {
+                let mut counts: HashMap<Vec<u8>, usize> = HashMap::new();
+                for v in &found_values {
+                    *counts.entry(v.clone()).or_insert(0) += 1;
                 }
-                self.base.nearest.push(r.get_node_list());
+                if counts.len() > 1 {
+                    log::warn!(
+                        "Multiple distinct values found for key {:?} — returning majority",
+                        self.base.node.long_id
+                    );
+                }
+                let value = counts.into_iter().max_by_key(|(_, c)| *c).map(|(v, _)| v);
+                if let Some(ref v) = value {
+                    if let Some(peer) = self.nearest_without_value.popleft() {
+                        self.base
+                            .protocol
+                            .call_store(&peer, self.base.node.id, v.clone())
+                            .await;
+                    }
+                }
+                return (value, vec![]);
+            }
+
+            if self.base.nearest.have_contacted_all() {
+                return (None, self.base.nearest.to_vec());
             }
         }
-        self.base.nearest.remove(&to_remove);
-
-        if !found_values.is_empty() {
-            return self.handle_found_values(found_values).await;
-        }
-        if self.base.nearest.have_contacted_all() {
-            return None; // not found
-        }
-        self.find_inner().await
-    }
-
-    /// Pick the most common value, store it on the nearest node that was
-    /// missing it, and return it.
-    async fn handle_found_values(mut self, values: Vec<Vec<u8>>) -> Option<Vec<u8>> {
-        let mut counts: HashMap<Vec<u8>, usize> = HashMap::new();
-        for v in &values {
-            *counts.entry(v.clone()).or_insert(0) += 1;
-        }
-        if counts.len() > 1 {
-            log::warn!(
-                "Multiple distinct values found for key {:?} — returning majority",
-                self.base.node.long_id
-            );
-        }
-        let value = counts.into_iter().max_by_key(|(_, c)| *c).map(|(v, _)| v)?;
-
-        // Kademlia § 2.3: store the value on the nearest node that missed it.
-        if let Some(peer) = self.nearest_without_value.popleft() {
-            self.base
-                .protocol
-                .call_store(&peer, self.base.node.id, value.clone())
-                .await;
-        }
-
-        Some(value)
     }
 }
 
@@ -273,36 +256,29 @@ impl<P: SpiderProtocol + 'static> NodeSpiderCrawl<P> {
     }
 
     /// Run the lookup and return the k closest nodes found.
-    pub async fn find(self) -> Vec<Node> {
-        self.find_inner().await
-    }
+    pub async fn find(mut self) -> Vec<Node> {
+        loop {
+            let responses = self
+                .base
+                .find_round(
+                    |proto, peer, node| async move { proto.call_find_node(peer, node).await },
+                )
+                .await;
 
-    #[async_recursion]
-    async fn find_inner(mut self) -> Vec<Node> {
-        let responses = self
-            .base
-            .find_round(|proto, peer, node| async move { proto.call_find_node(peer, node).await })
-            .await;
-        self.nodes_found(responses).await
-    }
+            let mut to_remove: Vec<[u8; ID_LEN]> = vec![];
+            for (peer_id, raw) in &responses {
+                let r = RPCFindResponse::new(raw.clone());
+                if !r.happened() {
+                    to_remove.push(*peer_id);
+                } else {
+                    self.base.nearest.push(r.get_node_list());
+                }
+            }
+            self.base.nearest.remove(&to_remove);
 
-    #[async_recursion]
-    async fn nodes_found(mut self, responses: HashMap<[u8; ID_LEN], RawResponse>) -> Vec<Node> {
-        let mut to_remove: Vec<[u8; ID_LEN]> = vec![];
-
-        for (peer_id, raw) in &responses {
-            let r = RPCFindResponse::new(raw.clone());
-            if !r.happened() {
-                to_remove.push(*peer_id);
-            } else {
-                self.base.nearest.push(r.get_node_list());
+            if self.base.nearest.have_contacted_all() {
+                return self.base.nearest.to_vec();
             }
         }
-        self.base.nearest.remove(&to_remove);
-
-        if self.base.nearest.have_contacted_all() {
-            return self.base.nearest.to_vec();
-        }
-        self.find_inner().await
     }
 }

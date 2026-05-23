@@ -41,30 +41,27 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-// ── Port allocations ──────────────────────────────────────────────────────────
 // Clusters run sequentially so ports can be reused between phases,
 // but we keep them distinct from stress_test (15800-15804).
-const CACHED_SEED:   u16 = 15810;
-const CACHED_PEER1:  u16 = 15811;
-const CACHED_PEER2:  u16 = 15812;
-const UNCACHED_SEED:  u16 = 15813;
+const CACHED_SEED: u16 = 15810;
+const CACHED_PEER1: u16 = 15811;
+const CACHED_PEER2: u16 = 15812;
+const UNCACHED_SEED: u16 = 15813;
 const UNCACHED_PEER1: u16 = 15814;
 const UNCACHED_PEER2: u16 = 15815;
 // Isolated single-node clusters for Phase 2 micro-benchmark.
 // Must be fresh (empty cache) so TinyLFU eviction from Phase 1 does not
 // interfere with cache hit measurements.
-const MICRO_CACHED_PORT:   u16 = 15816;
+const MICRO_CACHED_PORT: u16 = 15816;
 const MICRO_UNCACHED_PORT: u16 = 15817;
 
-const DEFAULT_OPS:         usize = 300;
+const DEFAULT_OPS: usize = 300;
 const DEFAULT_CONCURRENCY: usize = 20;
 // Micro-bench uses fewer ops: each op is sequential (~100 µs each), so 500
 // gives a stable average in < 0.1 s total per cluster.
 const MICRO_OPS: usize = 500;
 
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
-
-// ── Latency helpers ───────────────────────────────────────────────────────────
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
     if sorted.is_empty() {
@@ -75,14 +72,25 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 }
 
 fn avg_ns(v: &[u64]) -> f64 {
-    if v.is_empty() { return 0.0; }
+    if v.is_empty() {
+        return 0.0;
+    }
     v.iter().sum::<u64>() as f64 / v.len() as f64
 }
 
 fn stddev_ns(v: &[u64]) -> f64 {
-    if v.len() < 2 { return 0.0; }
+    if v.len() < 2 {
+        return 0.0;
+    }
     let mean = avg_ns(v);
-    let var = v.iter().map(|&x| { let d = x as f64 - mean; d * d }).sum::<f64>() / v.len() as f64;
+    let var = v
+        .iter()
+        .map(|&x| {
+            let d = x as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / v.len() as f64;
     var.sqrt()
 }
 
@@ -95,8 +103,6 @@ fn fmt_dur(ns: u64) -> String {
         format!("{:.1}ms", ns as f64 / 1_000_000.0)
     }
 }
-
-// ── DID / record helpers ──────────────────────────────────────────────────────
 
 fn base64url(pk: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(pk)
@@ -120,7 +126,7 @@ fn sort_json_keys(v: &Value) -> Value {
 
 fn new_record() -> (String, Vec<u8>) {
     let (dpk, dsk) = dilithium2::keypair();
-    let (kpk, _)   = kyber512::keypair();
+    let (kpk, _) = kyber512::keypair();
     let did = format!("did:iiot:{}", Uuid::new_v4());
     let key = did.split(':').next_back().unwrap().to_string();
     let doc = json!({
@@ -145,7 +151,8 @@ fn new_record() -> (String, Vec<u8>) {
     let mut alg = [0u8; 12];
     alg[..11].copy_from_slice(b"Dilithium-2");
     let sig = dilithium2::detached_sign(&doc_bytes, &dsk);
-    let sig_bytes = <dilithium2::DetachedSignature as pqcrypto_traits::sign::DetachedSignature>::as_bytes(&sig);
+    let sig_bytes =
+        <dilithium2::DetachedSignature as pqcrypto_traits::sign::DetachedSignature>::as_bytes(&sig);
     let mut record = Vec::with_capacity(12 + sig_bytes.len() + doc_bytes.len());
     record.extend_from_slice(&alg);
     record.extend_from_slice(sig_bytes);
@@ -153,16 +160,16 @@ fn new_record() -> (String, Vec<u8>) {
     (key, record)
 }
 
-// ── Cluster factory ───────────────────────────────────────────────────────────
-
 async fn start_cluster(seed: u16, peer1: u16, peer2: u16, use_cache: bool) -> Vec<Arc<Server>> {
     let make = |port: u16| async move {
-        let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
+        let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from(
+            "issuer.bin",
+        )));
         let mut srv = Server::new(handler, 20, 3, None, None, use_cache);
         srv.listen(port, "127.0.0.1").await.expect("listen failed");
         Arc::new(srv)
     };
-    let s  = make(seed).await;
+    let s = make(seed).await;
     let p1 = make(peer1).await;
     let p2 = make(peer2).await;
     p1.bootstrap(vec![("127.0.0.1".to_string(), seed)]).await;
@@ -171,32 +178,30 @@ async fn start_cluster(seed: u16, peer1: u16, peer2: u16, use_cache: bool) -> Ve
     vec![s, p1, p2]
 }
 
-// ── Phase 1: DHT SET throughput ───────────────────────────────────────────────
-
 struct SetResults {
-    set_ns:    Vec<u64>,
-    ok:        usize,
-    failures:  usize,
+    set_ns: Vec<u64>,
+    ok: usize,
+    failures: usize,
     wall_secs: f64,
 }
 
 async fn run_set_workload(nodes: &[Arc<Server>], num_ops: usize, concurrency: usize) -> SetResults {
-    let set_ns   = Arc::new(Mutex::new(Vec::<u64>::with_capacity(num_ops)));
-    let ok       = Arc::new(AtomicUsize::new(0));
+    let set_ns = Arc::new(Mutex::new(Vec::<u64>::with_capacity(num_ops)));
+    let ok = Arc::new(AtomicUsize::new(0));
     let failures = Arc::new(AtomicUsize::new(0));
-    let done     = Arc::new(AtomicUsize::new(0));
-    let sem      = Arc::new(Semaphore::new(concurrency));
+    let done = Arc::new(AtomicUsize::new(0));
+    let sem = Arc::new(Semaphore::new(concurrency));
 
     let wall = Instant::now();
     let mut handles = Vec::with_capacity(num_ops);
 
     for i in 0..num_ops {
         let writer = Arc::clone(&nodes[i % nodes.len()]);
-        let sem    = Arc::clone(&sem);
+        let sem = Arc::clone(&sem);
         let set_ns = Arc::clone(&set_ns);
-        let ok     = Arc::clone(&ok);
-        let fail   = Arc::clone(&failures);
-        let done   = Arc::clone(&done);
+        let ok = Arc::clone(&ok);
+        let fail = Arc::clone(&failures);
+        let done = Arc::clone(&done);
 
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
@@ -218,16 +223,21 @@ async fn run_set_workload(nodes: &[Arc<Server>], num_ops: usize, concurrency: us
             }
         }));
     }
-    for h in handles { let _ = h.await; }
+    for h in handles {
+        let _ = h.await;
+    }
     let wall_secs = wall.elapsed().as_secs_f64();
     println!("\r    {num_ops}/{num_ops}  ✓        ");
 
     let mut v = set_ns.lock().await.clone();
     v.sort_unstable();
-    SetResults { set_ns: v, ok: ok.load(Ordering::Relaxed), failures: failures.load(Ordering::Relaxed), wall_secs }
+    SetResults {
+        set_ns: v,
+        ok: ok.load(Ordering::Relaxed),
+        failures: failures.load(Ordering::Relaxed),
+        wall_secs,
+    }
 }
-
-// ── Phase 2: Signature verification micro-benchmark ──────────────────────────
 
 struct VerifyResults {
     cold_ns: Vec<u64>,
@@ -241,9 +251,13 @@ struct VerifyResults {
 /// do not evict Phase 2 entries before the warm pass runs.
 async fn run_verify_micro(port: u16, use_cache: bool, n: usize) -> VerifyResults {
     // Fresh node — cache is empty, no Phase 1 pollution.
-    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
+    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from(
+        "issuer.bin",
+    )));
     let mut srv = Server::new(handler, 20, 3, None, None, use_cache);
-    srv.listen(port, "127.0.0.1").await.expect("micro-bench listen failed");
+    srv.listen(port, "127.0.0.1")
+        .await
+        .expect("micro-bench listen failed");
     let node = Arc::new(srv);
 
     // Pre-generate records outside the timed section.
@@ -276,13 +290,15 @@ async fn run_verify_micro(port: u16, use_cache: bool, n: usize) -> VerifyResults
     VerifyResults { cold_ns, warm_ns }
 }
 
-// ── Reporting ─────────────────────────────────────────────────────────────────
-
 fn print_set_table(label: &str, r: &SetResults, num_ops: usize) {
     let tp = num_ops as f64 / r.wall_secs;
-    println!("  [{label}]  {:.1} ops/s  (wall {:.2}s)  ok/fail {}/{}",
-             tp, r.wall_secs, r.ok, r.failures);
-    if r.set_ns.is_empty() { return; }
+    println!(
+        "  [{label}]  {:.1} ops/s  (wall {:.2}s)  ok/fail {}/{}",
+        tp, r.wall_secs, r.ok, r.failures
+    );
+    if r.set_ns.is_empty() {
+        return;
+    }
     println!(
         "    SET  avg {:>8}  p50 {:>8}  p95 {:>8}  p99 {:>8}  max {:>8}",
         fmt_dur(avg_ns(&r.set_ns) as u64),
@@ -307,13 +323,17 @@ fn print_verify_table(label: &str, r: &VerifyResults) {
     }
 }
 
-// ── main ──────────────────────────────────────────────────────────────────────
-
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let num_ops:     usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_OPS);
-    let concurrency: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_CONCURRENCY);
+    let num_ops: usize = args
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_OPS);
+    let concurrency: usize = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CONCURRENCY);
 
     println!("╔═══════════════════════════════════════════════════════════╗");
     println!("║       AuthKademlia-RS  Signature Cache Benchmark          ║");
@@ -350,8 +370,12 @@ async fn main() {
     let set_c = avg_ns(&cached_set.set_ns);
     let set_u = avg_ns(&uncached_set.set_ns);
     if set_c > 0.0 && set_u > 0.0 {
-        println!("\n  SET speedup: {:.1}×  ({} cached  vs  {} uncached)",
-                 set_u / set_c, fmt_dur(set_c as u64), fmt_dur(set_u as u64));
+        println!(
+            "\n  SET speedup: {:.1}×  ({} cached  vs  {} uncached)",
+            set_u / set_c,
+            fmt_dur(set_c as u64),
+            fmt_dur(set_u as u64)
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -363,7 +387,7 @@ async fn main() {
     println!("  (fresh nodes, empty cache, local storage only, sequential GETs)\n");
 
     // Fresh nodes on isolated ports — no TinyLFU pollution from Phase 1.
-    let cached_v   = run_verify_micro(MICRO_CACHED_PORT,   true,  MICRO_OPS).await;
+    let cached_v = run_verify_micro(MICRO_CACHED_PORT, true, MICRO_OPS).await;
     print_verify_table("cached  ", &cached_v);
     println!();
     let uncached_v = run_verify_micro(MICRO_UNCACHED_PORT, false, MICRO_OPS).await;
@@ -379,15 +403,24 @@ async fn main() {
     println!("  ┌─────────────┬─────────────────┬─────────────────┬────────────┐");
     println!("  │             │  cached (avg)   │ uncached (avg)  │  speedup   │");
     println!("  ├─────────────┼─────────────────┼─────────────────┼────────────┤");
-    println!("  │ DHT SET     │ {:>15} │ {:>15} │ {:>9.1}× │",
-             fmt_dur(set_c as u64), fmt_dur(set_u as u64),
-             if set_c > 0.0 { set_u / set_c } else { 0.0 });
-    println!("  │ GET cold    │ {:>15} │ {:>15} │ {:>9.1}× │",
-             fmt_dur(cold_c as u64), fmt_dur(cold_u as u64),
-             if cold_c > 0.0 { cold_u / cold_c } else { 0.0 });
-    println!("  │ GET warm    │ {:>15} │ {:>15} │ {:>9.1}× │",
-             fmt_dur(warm_c as u64), fmt_dur(warm_u as u64),
-             if warm_c > 0.0 { warm_u / warm_c } else { 0.0 });
+    println!(
+        "  │ DHT SET     │ {:>15} │ {:>15} │ {:>9.1}× │",
+        fmt_dur(set_c as u64),
+        fmt_dur(set_u as u64),
+        if set_c > 0.0 { set_u / set_c } else { 0.0 }
+    );
+    println!(
+        "  │ GET cold    │ {:>15} │ {:>15} │ {:>9.1}× │",
+        fmt_dur(cold_c as u64),
+        fmt_dur(cold_u as u64),
+        if cold_c > 0.0 { cold_u / cold_c } else { 0.0 }
+    );
+    println!(
+        "  │ GET warm    │ {:>15} │ {:>15} │ {:>9.1}× │",
+        fmt_dur(warm_c as u64),
+        fmt_dur(warm_u as u64),
+        if warm_c > 0.0 { warm_u / warm_c } else { 0.0 }
+    );
     println!("  └─────────────┴─────────────────┴─────────────────┴────────────┘");
     println!();
     println!("  Cold GET: first read — full Dilithium-2 for both (cache miss).");
