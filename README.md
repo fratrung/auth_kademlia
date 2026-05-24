@@ -108,60 +108,41 @@ By inspecting fragments you can identify the internal composition of a PQC recor
 | **Concurrent storage** | `DashMap` replaces `IndexMap + RwLock`. Storage operations on different keys are fully parallel with no single global lock. |
 | **Lazy TTL expiry** | Expired entries are filtered at read time instead of an O(n) scan on every write. |
 | **Signature cache** | `SignatureCache` (moka, SHA-256 keyed, TTL 1 h, 4096 entries). Repeated reads of the same record pay full Dilithium cost only once; subsequent reads are O(1). Any byte-level change forces full re-verification. |
-| **Worker pool** | UDP datagrams are dispatched via a bounded `mpsc::channel(1024)` into 4 fixed workers, capping task count under burst load and providing backpressure. |
+| **Worker pool** | UDP receive loop dispatches via round-robin into `available_parallelism()` workers, each with a dedicated `mpsc::channel(256)`. `try_send` is attempted on each worker in turn; if all are full the loop awaits the base worker, providing backpressure without drops. |
 | **Fire-and-forget routing** | Routing table updates (`welcome_if_new`) are spawned as background tasks in all RPC handlers. RPC responses are sent immediately without waiting for routing convergence. |
 | **Replication filter** | On node join, only nodes XOR-closer to a key than the new node replicate it (Kademlia §2.5). Prevents redundant store RPCs from far-away nodes. |
 | **Atomic insert** | `rpc_store` uses a DashMap `Entry`-based `insert_if_absent` — eliminates the TOCTOU race window that existed with the old read-then-write pattern. |
 
-### Stress test limits
+### Throughput limits
 
-Measured on a single machine (3 local nodes, loopback, `examples/stress_test.rs`).
-Each operation is a full `set` → `get` round-trip including Dilithium-2 signature
-verification (~5 ms CPU per record).
+Each `set` → `get` round-trip includes a full Dilithium-2 signature verification
+(~5 ms CPU time on a modern x86 core). The blocking thread pool is capped at
+`available_parallelism()` threads, so peak verification throughput scales linearly
+with core count — approximately `N_cores / 5 ms` unique verifications per second.
 
-| Concurrency | Ops | Result |
-|---|---|---|
-| 10 | 1 000 | Stable — all ops succeed, p99 well under 5 s RPC timeout |
-| 20 | 1 000 | Stable |
-| 30 | 1 000 | Stable |
-| 50 | 1 000 | Stable — practical maximum for real-time use |
-| 60 | 1 000 | Degraded — Dilithium-2 CPU backlog starts to overflow the 5 s RPC timeout; occasional failures |
-| 80 | 1 000 | Unstable — node saturation; significant failure rate |
+When the request rate exceeds drain capacity, the verification queue grows and RPC
+calls begin hitting the 5-second timeout. The `SignatureCache` substantially raises
+the practical ceiling: once a record has been verified once, subsequent reads return
+the cached result in O(1) time with no blocking work.
 
-**Bottleneck**: Dilithium-2 signature verification (~5 ms/record × 4 workers = ~800
-ops/s peak throughput). At concurrency ≥ 60, the verification queue grows faster
-than workers drain it and RPC calls begin to time out.
-
-**Mitigations already in place**: the shared `SignatureCache` means each unique
-record is verified at most once per hour. In production workloads with repeated
-reads the effective throughput is much higher than the raw numbers above.
+Run `cargo run --release --example stress_test -- <ops> <concurrency>` to measure
+on your own hardware; results vary significantly with core count and clock speed.
 
 ### Signature cache benchmark
 
-Measured with `examples/cache_bench.rs` using two isolated phases:
+`examples/cache_bench.rs` measures two isolated phases:
 
-- **Phase 1 — DHT SET throughput**: clusters run sequentially (no CPU contention), real network operations.
-- **Phase 2 — Signature verification micro-benchmark**: records injected directly into local storage, sequential `get()` calls, zero network variance. This isolates the exact cost of signature verification.
+- **Phase 1 — DHT SET throughput**: two sequential clusters (cached vs uncached) running real network operations with no CPU contention between them.
+- **Phase 2 — Signature verification micro-benchmark**: records injected directly into local storage, sequential `get()` calls, zero network variance. Isolates the exact Dilithium-2 vs cache-hit cost.
 
-**Stable results across 3 runs — 8000 SET ops (c=30), micro-bench 500 ops sequential**
-(`cargo run --release --example cache_bench -- 8000 30`):
+The expected behaviour:
+- *GET cold*: cache miss → SHA-256(record) + `moka.get()` miss + `spawn_blocking(Dilithium-2)` + `moka.insert()`. The SHA-256 overhead is small relative to Dilithium (~5 ms); on first read the cached node pays a marginal extra cost.
+- *GET warm*: cache hit → SHA-256(record) + `moka.get()` → result returned immediately. No blocking work. Speedup is proportional to the Dilithium-2 cost on the target hardware.
+- *DHT SET*: dominated by network round-trip; cache has negligible effect on write throughput.
 
-| Operation | Cached (avg) | Uncached (avg) | Speedup |
-|---|---|---|---|
-| DHT SET | ~3.5 ms | ~3.6 ms | ~1× |
-| GET cold (local) | ~84 µs | ~74 µs | 0.9× |
-| GET warm (local) | **~9.6 µs** | ~74 µs | **~7.8×** |
-
-Variance across 3 runs: GET warm cached 9.4–9.7 µs (CV < 4%) — results are stable and reproducible.
-
-**How to read the numbers:**
-
-- *DHT SET*: comparable for both clusters — write throughput is dominated by network roundtrip, not signature verification.
-- *GET cold*: the cached cluster pays a ~10 µs overhead on cache miss (one SHA-256 of the 6 KB record + `moka.insert()`), making it marginally *slower* than uncached on first read. This is unavoidable: the cache key must be computed at least once to know there is no hit. The overhead is bounded and non-regressing.
-- *GET warm*: the primary signal — one SHA-256 cache lookup (~9.6 µs) vs full Dilithium-2 re-verification (~74 µs) = **7–8× speedup**. This is the path that matters for IoT nodes that read the same DID Document repeatedly (e.g. device authentication on every connection).
-
-The cache can be disabled per-node (`Server::new(..., use_cache: false)`) for
-security auditing or benchmarking without touching any other code path.
+Run `cargo run --release --example cache_bench -- <ops> <concurrency>` to collect
+measurements on your own hardware. The cache can be disabled per-node by passing
+`use_cache: false` to `Server::new` for benchmarking or security auditing.
 
 -----
 
@@ -321,43 +302,44 @@ fn build_did_document(
 
 async fn start_node(port: u16) -> Server {
     let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
-    let mut server = Server::new(handler, 20, 3, None, None);
-    server.listen(port, "127.0.0.1").await.expect("failed to bind UDP socket");
+    // use_cache=false: signature cache disabled for this example.
+    // Pass true to enable the SignatureCache (recommended in production).
+    let mut server = Server::new(handler, 20, 3, None, None, false);
+    server.listen(port, "127.0.0.1").await.expect("failed to bind");
     server
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let parallelism = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+    tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(parallelism)
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let node_1 = start_node(5678).await;
     let node_2 = start_node(5679).await;
 
-    // Bootstrap node_2 into the network via node_1.
-    let discovered = node_2.bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
-    if discovered.is_empty() {
-        eprintln!("Bootstrap returned no peers — is node_1 reachable?");
-        return Ok(());
-    }
+    node_2.bootstrap(vec![("127.0.0.1".to_string(), 5678)]).await;
 
-    // Generate PQC keypairs and build a DID Document.
     let (dilithium_pk, dilithium_sk) = dilithium2::keypair();
     let (kyber_pk, _) = kyber512::keypair();
     let did = generate_did_iiot();
     let did_doc = build_did_document(&did, &dilithium_pk, &kyber_pk);
-    let dht_key = did.split(':').next_back().expect("invalid DID format").to_string();
+    let dht_key = did.split(':').next_back().expect("invalid DID").to_string();
     let signed_record = build_signed_record(&did_doc, &dilithium_sk, "Dilithium-2");
 
-    // Publish: set() returns None if the key exists or the signature is invalid.
     match node_2.set(&dht_key, signed_record).await {
         Some(true) => println!("Record published under key {}", dht_key),
-        _ => {
-            eprintln!("Failed to publish record");
-            return Ok(());
-        }
+        _ => { eprintln!("Failed to publish record"); return Ok(()); }
     }
 
-    // Retrieve from a different node.
     match node_1.get(&dht_key).await {
         Some(record) => {
             let doc_start = 12 + dilithium2::signature_bytes();
@@ -372,6 +354,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 ```
+
+## Tokio runtime configuration
+
+`auth_kademlia_rs` does not create a Tokio runtime — the caller owns it. Dilithium-2
+verification is CPU-bound and runs on Tokio's blocking thread pool via `spawn_blocking`.
+On embedded hardware (2–4 core ARM SoCs) the default pool cap of 512 threads causes
+unnecessary context-switching overhead. Cap it to the number of physical cores:
+
+```rust
+fn main() {
+    let parallelism = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+    tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(parallelism)  // bounds concurrent Dilithium verifications
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(run())
+}
+```
+
+This setting is already applied in `scripts/dht_node.rs` (the Docker entry point) and
+in all examples under `examples/`. If you embed the library in your own binary, apply
+the same builder pattern instead of `#[tokio::main]`.
 
 ## Logging
 

@@ -28,6 +28,30 @@ Python extension (maturin, optional — do not use in Rust-only deployments):
 maturin develop --features python
 ```
 
+## Tokio runtime — caller responsibility
+
+`auth_kademlia_rs` does **not** create a Tokio runtime. The caller must build one and
+pass execution into it. To cap the blocking thread pool (used for Dilithium
+`spawn_blocking` calls) to the number of physical cores — critical on embedded nodes:
+
+```rust
+fn main() {
+    let parallelism = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+    tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(parallelism)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(run())
+}
+```
+
+**Never use `#[tokio::main]`** in entry points that host `Server` — it uses the
+default cap of 512 blocking threads, which thrashes the CPU on low-core SoCs.
+`scripts/dht_node.rs` and all `examples/` already apply this pattern.
+
 ## Module map
 | File | Role |
 |---|---|
@@ -92,9 +116,11 @@ All RPCs are serialised with `bincode` and framed with a `(msg_id: u32, is_reque
 - `ForgetfulStorage` is `Arc<ForgetfulStorage>` (no outer `RwLock`). All `IStorage` methods take `&self`; internal synchronization via `DashMap` shards.
 - `rpc_store` uses `insert_if_absent` (DashMap `Entry` API) — atomic at shard level, closes the TOCTOU race between "does key exist?" and "write it".
 - All RPC handlers use `self: &Arc<Self>` receiver to enable `tokio::spawn` without cloning the full struct. `welcome_if_new` is always fire-and-forget.
-- UDP receive loop spawns one Tokio task per datagram. An `inflight` semaphore (capacity 1024) in `network.rs::listen()` bounds the number of tasks in flight: when full, the datagram is dropped (UDP-native backpressure — bounds memory under load). Responses take the fast path (no semaphore). Requests invoke `req_sem` (sized to `available_parallelism()`) only around the `spawn_blocking` crypto call, so fast RPCs (ping, find_node) are never gated.
+- UDP receive loop dispatches via round-robin to `available_parallelism()` fixed workers, each with a dedicated `mpsc::channel(256)`. `try_send` is attempted on each worker in order; if all channels are full the receive loop awaits the base worker (backpressure without drops). Zero allocations per datagram beyond the payload copy.
+- Blocking thread pool (`spawn_blocking`) is bounded at the runtime level via `max_blocking_threads(available_parallelism())` in `scripts/dht_node.rs`. This caps concurrent Dilithium verifications to the number of physical cores, covering all call sites uniformly (`verify_for_key`, `verify_value`, `update`, `delete`). `KademliaProtocol` carries no application-level semaphore.
 - `SignatureCache` is keyed on `SHA-256(record_bytes)`. TTL 1 h, capacity 4096 (moka TinyLFU). Eviction = cache miss = full re-verification (never a security bypass). On a cache miss the SHA-256 key is computed once via `compute_key()` and reused for both `get_by_key` and `insert_by_key` — never twice.
 - `welcome_if_new` replication uses two conditions (Kademlia §2.5, matches Python AuthKademlia): `new_node_close` (new node is XOR-closer than the farthest k-neighbor) AND `this_closest` (this node is closer than the nearest k-neighbor). Both must be true to replicate. Neighbors are computed before `add_contact` so the new node is excluded from comparisons.
+- `schedule_stats_log()` emits a `[stats]` log line every 60 s: routing table size, storage record count, and (when the cache is enabled) signature cache entry count. Detects silent failures — routing table collapse, cache regression — on embedded nodes without direct access.
 
 ## Key invariants
 - Records are **immutable after creation**: `rpc_store` rejects duplicate keys.
@@ -118,6 +144,11 @@ All RPCs are serialised with `bincode` and framed with a `(msg_id: u32, is_reque
 | `tests/routing_tests.rs` | 20 | Routing table unit tests |
 | `tests/storage_tests.rs` | 17 | `ForgetfulStorage` unit tests (includes `insert_if_absent` cases) |
 | `tests/dht_integration.rs` | 1 | Legacy 3-node end-to-end scenario |
+| `tests/scenarios/replication.rs` | 1 | welcome_if_new replication (3-node join) |
+| `tests/scenarios/cache.rs` | 2 | SignatureCache hit-rate + false caching |
+| `tests/scenarios/churn.rs` | 1 | Publisher leaves, record survives for new joiner |
+| `tests/scenarios/worker_pool.rs` | 1 | 40-client burst, all responses delivered |
+| `tests/scenarios/crypto.rs` | 4 | End-to-end crypto invariants (tamper, injection, downgrade, revocation) |
 | `src/**` (inline) | 56 | Module-level `#[test]` blocks |
 
 All tests are network-clean (loopback only) and run in parallel without interference when port ranges are respected.
@@ -135,8 +166,16 @@ All tests are network-clean (loopback only) and run in parallel without interfer
 | 15780–15781 | update rejected on invalid new-record self-signature |
 | 15782–15784 | update rejected when auth_sig uses wrong key |
 | 15785–15786 | delete rejected when signature uses wrong key |
+| 15787–15789 | scenario: welcome_if_new replication (A, B, C) |
+| 15790 | scenario: signature cache hit rate |
+| 15792–15795 | scenario: churn survivability (A seed, B publisher, C stays, D new joiner) |
+| 15800–15840 | scenario: worker pool burst (target + 40 clients) |
+| 15810–15817 | cache_bench example (Phase 1 + Phase 2 clusters) |
+| 15860–15861 | scenario: tampered payload / algorithm injection rejected |
+| 15862–15863 | scenario: downgrade attack after rotation rejected |
+| 15864–15865 | scenario: revoked key cannot authorise further rotation |
 
-When adding a new integration test use ports **15787+** and document them here.
+When adding a new integration test use ports **15866+** and document them here.
 
 ## Docker
 ```

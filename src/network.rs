@@ -1,8 +1,3 @@
-/// High-level Kademlia node (Server).
-///
-/// `Server` is the public API surface of the DHT. It manages the UDP socket,
-/// the protocol instance, background refresh/save tasks, and exposes the
-/// `get`, `set`, `update`, and `delete` operations used by application code.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,9 +23,9 @@ pub struct Server {
     refresh_loop: Option<tokio::task::JoinHandle<()>>,
     save_state_loop: Option<tokio::task::JoinHandle<()>>,
     signature_handler: Arc<dyn SignatureVerifierHandler>,
-    /// Shared with `KademliaProtocol` so a verification result cached at the
-    /// network layer (rpc_store) is immediately reused at the API layer (get/set)
-    /// and vice versa. `None` when the cache is disabled via `use_cache: false`.
+    /// Shared with `KademliaProtocol` so a cache hit at the network layer
+    /// (rpc_store) is visible at the API layer (get/set) and vice versa.
+    /// `None` when the cache is disabled.
     sig_cache: Option<Arc<SignatureCache>>,
 }
 
@@ -38,14 +33,12 @@ impl Server {
     /// Create a new server instance.
     ///
     /// - `signature_handler` — pluggable signature verification strategy.
-    /// - `ksize`             — Kademlia k parameter (bucket size, default 20).
-    /// - `alpha`             — concurrency factor (default 3).
-    /// - `node_id`           — fixed node ID; pass `None` for a random one.
-    /// - `storage`           — custom storage; pass `None` for the default.
-    /// - `use_cache`         — enable the signature verification cache (recommended:
-    ///                         `true`). Pass `false` to force full Dilithium
-    ///                         re-verification on every operation (useful for
-    ///                         benchmarking or security auditing).
+    /// - `ksize`             — Kademlia k parameter (bucket size).
+    /// - `alpha`             — lookup concurrency factor.
+    /// - `node_id`           — fixed node ID; `None` picks one at random.
+    /// - `storage`           — custom storage; `None` uses the default TTL store.
+    /// - `use_cache`         — enable the Dilithium verification cache. Set to
+    ///                         `false` only for benchmarking or security audits.
     pub fn new(
         signature_handler: Arc<dyn SignatureVerifierHandler>,
         ksize: usize,
@@ -81,12 +74,11 @@ impl Server {
         }
     }
 
-    /// Bind to `interface:port` and start the UDP receive loop.
+    /// Bind to `interface:port` and start the receive loop.
     ///
-    /// Each datagram is handled in its own Tokio task. A semaphore caps the
-    /// number of tasks in flight: when the limit is reached the datagram is
-    /// dropped — UDP-native backpressure that bounds memory under load without
-    /// serialising any processing.
+    /// Datagrams are round-robin dispatched to `available_parallelism()` workers,
+    /// each backed by a dedicated `mpsc::channel(256)`. When all channels are
+    /// full the receive loop blocks on the base worker rather than dropping.
     pub async fn listen(&mut self, port: u16, interface: &str) -> tokio::io::Result<()> {
         let addr = format!("{}:{}", interface, port);
         let socket = Arc::new(UdpSocket::bind(&addr).await?);
@@ -102,29 +94,45 @@ impl Server {
         ));
         self.protocol = Some(Arc::clone(&protocol));
 
-        const MAX_INFLIGHT: usize = 1024;
-        let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT));
+        const WORKER_QUEUE_DEPTH: usize = 256;
+        let num_workers = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4);
+
+        let mut senders = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let (tx, mut rx) =
+                tokio::sync::mpsc::channel::<(Vec<u8>, std::net::SocketAddr)>(WORKER_QUEUE_DEPTH);
+            senders.push(tx);
+            let proto = Arc::clone(&protocol);
+            tokio::spawn(async move {
+                while let Some((data, peer)) = rx.recv().await {
+                    proto.handle_datagram(data, peer).await;
+                }
+            });
+        }
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65_536];
+            let mut idx = 0usize;
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, peer)) => {
                         let data = buf[..len].to_vec();
-                        let proto = Arc::clone(&protocol);
-                        match Arc::clone(&inflight).try_acquire_owned() {
-                            Ok(permit) => {
-                                tokio::spawn(async move {
-                                    proto.handle_datagram(data, peer).await;
-                                    drop(permit);
-                                });
+                        let base = idx;
+                        let mut sent = false;
+                        for i in 0..num_workers {
+                            let w = (base + i) % num_workers;
+                            if senders[w].try_send((data.clone(), peer)).is_ok() {
+                                idx = (w + 1) % num_workers;
+                                sent = true;
+                                break;
                             }
-                            Err(_) => {
-                                log::warn!(
-                                    "Max in-flight datagrams reached — dropping from {}",
-                                    peer
-                                );
-                            }
+                        }
+                        if !sent {
+                            let w = base % num_workers;
+                            let _ = senders[w].send((data, peer)).await;
+                            idx = (w + 1) % num_workers;
                         }
                     }
                     Err(e) => log::error!("UDP recv error: {}", e),
@@ -133,10 +141,11 @@ impl Server {
         });
 
         self.schedule_refresh();
+        self.schedule_stats_log();
         Ok(())
     }
 
-    /// Gracefully shut down: notify neighbours and cancel background tasks.
+    /// Notify neighbours of departure and cancel background tasks.
     pub async fn stop(&mut self) {
         if let Some(proto) = &self.protocol {
             let neighbors = proto.router.read().await.find_neighbors(&self.node, None);
@@ -158,12 +167,10 @@ impl Server {
         }
     }
 
-    /// Bootstrap the node by contacting a list of known peers.
-    ///
-    /// Returns the k-closest nodes discovered during the initial lookup.
+    /// Ping each address in `addrs`, then run a `NodeSpiderCrawl` to populate
+    /// the routing table. Returns the k-closest nodes discovered.
     pub async fn bootstrap(&self, addrs: Vec<(String, u16)>) -> Vec<Node> {
         log::debug!("Bootstrapping with {} initial contacts", addrs.len());
-        println!(">>> Bootstrapping with {} initial contacts", addrs.len());
         let mut futs = vec![];
         for addr in addrs {
             futs.push(self.bootstrap_node(addr));
@@ -201,19 +208,13 @@ impl Server {
         Some(Node::new(id, Some(addr.0), Some(addr.1)))
     }
 
-    /// Look up `key` in the DHT.
-    ///
-    /// Checks local storage first, then performs an iterative network lookup.
-    /// The Dilithium signature is verified on every hit (local via cache, network inline).
-    /// Returns `None` if the key is not found or the signature is invalid.
+    /// Look up `key` in the DHT. Checks local storage first, then performs an
+    /// iterative FIND_VALUE. Verifies the Dilithium signature on every hit.
+    /// Returns `None` if the key is absent or the signature is invalid.
     pub async fn get(&self, key: &str) -> Option<Vec<u8>> {
         log::info!("get({})", key);
         let dkey = digest(key);
 
-        // Local hits are re-verified via the signature cache: first access pays
-        // full Dilithium cost; subsequent reads of the same record are O(1).
-        // This matches the paper (§4.4): "the requesting node verifies the
-        // signature before accepting the record."
         if let Some(result) = self.storage.get(&dkey) {
             return if self.verify_value(key, &result).await {
                 Some(result)
@@ -250,8 +251,9 @@ impl Server {
         }
     }
 
-    /// Used by `set()` only: performs a FIND_VALUE crawl and also returns the
-    /// k-closest nodes so they can be reused for the subsequent STORE without a
+    /// Run a FIND_VALUE crawl for `key` and return whether a valid record
+    /// already exists, together with the k-closest nodes for a subsequent STORE
+    /// (Kademlia §2.3 — reuse the crawl result to avoid a second traversal).
     async fn check_exists_and_get_nodes(&self, key: &str) -> (bool, Vec<Node>) {
         let dkey = digest(key);
 
@@ -285,16 +287,15 @@ impl Server {
         .await;
 
         match result {
-            // Verify before trusting: an invalid signature means no legitimate
-            // record exists at this key — the nodes are still usable for STORE.
+            // An invalid signature means no legitimate record owns this key;
+            // the crawl nodes are still valid targets for the upcoming STORE.
             Some(v) if self.verify_value(key, &v).await => (true, vec![]),
-            Some(_) => (false, nodes), // Invalid Signature case, but returns nodes to store the right DID Documet
+            Some(_) => (false, nodes),
             None => (false, nodes),
         }
     }
 
     /// Store `value` under `key` in the DHT.
-    ///
     /// Returns `None` if the key already exists or the signature is invalid.
     pub async fn set(&self, key: &str, value: Vec<u8>) -> Option<bool> {
         let (exists, nodes) = self.check_exists_and_get_nodes(key).await;
@@ -311,12 +312,10 @@ impl Server {
         Some(self.set_digest(dkey, value, nodes).await)
     }
 
-    /// Update an existing record.
-    ///
-    /// For regular DID Documents `auth_signature` must be a signature of
-    /// `value` produced with the private key of the *current* DID Document.
-    /// For the status-list key, `auth_signature` may be `None` (the issuer
-    /// node signature embedded in `value` is sufficient).
+    /// Update an existing record. For regular DID Documents `auth_signature`
+    /// must be produced with the private key of the current stored document.
+    /// For the status-list key `auth_signature` may be `None` (the issuer
+    /// node signature embedded in `value` is used instead).
     pub async fn update(
         &self,
         key: &str,
@@ -352,10 +351,8 @@ impl Server {
         Some(self.update_digest(key, dkey, value, auth_signature).await)
     }
 
-    /// Delete an existing record.
-    ///
-    /// `auth_signature` must be a signature of `delete_msg` produced with the
-    /// private key corresponding to the stored DID Document's public key.
+    /// Delete an existing record. `auth_signature` must be a signature of
+    /// `delete_msg` produced with the private key of the stored document.
     pub async fn delete(
         &self,
         key: &str,
@@ -502,8 +499,6 @@ impl Server {
             None => return false,
         };
 
-        // Always delete locally first — the caller has already verified the
-        // signature and confirmed the record exists.
         self.storage.delete(&dkey);
 
         let node = Node::from_id(dkey);
@@ -571,7 +566,7 @@ impl Server {
         result
     }
 
-    /// Return the addresses of bootstrappable neighbour nodes.
+    /// Return the addresses of known neighbours suitable for bootstrapping.
     pub async fn bootstrappable_neighbors(&self) -> Vec<(String, u16)> {
         match &self.protocol {
             Some(proto) => proto
@@ -586,7 +581,7 @@ impl Server {
         }
     }
 
-    /// Save node state (ksize, alpha, id, neighbours) to a JSON file.
+    /// Persist node state (ksize, alpha, id, neighbours) to a JSON file.
     pub async fn save_state(&self, fname: &str) {
         let neighbors = self.bootstrappable_neighbors().await;
         if neighbors.is_empty() {
@@ -606,7 +601,7 @@ impl Server {
         }
     }
 
-    /// Start a background task that saves node state every `frequency_secs` seconds.
+    /// Spawn a background task that writes node state every `frequency_secs` seconds.
     pub fn save_state_regularly(&mut self, fname: String, frequency_secs: u64) {
         let node = self.node.clone();
         let ksize = self.ksize;
@@ -639,6 +634,46 @@ impl Server {
             });
             self.save_state_loop = Some(handle);
         }
+    }
+
+    fn schedule_stats_log(&self) {
+        let proto = match &self.protocol {
+            Some(p) => Arc::clone(p),
+            None => return,
+        };
+        let storage = Arc::clone(&self.storage);
+        let sig_cache = self.sig_cache.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+
+                let routing_size: usize = proto
+                    .router
+                    .read()
+                    .await
+                    .buckets()
+                    .iter()
+                    .map(|b| b.len())
+                    .sum();
+
+                let storage_size = storage.iter_all().len();
+
+                match &sig_cache {
+                    Some(cache) => log::info!(
+                        "[stats] routing_table={} nodes  storage={} records  sig_cache={} entries",
+                        routing_size,
+                        storage_size,
+                        cache.entry_count(),
+                    ),
+                    None => log::info!(
+                        "[stats] routing_table={} nodes  storage={} records",
+                        routing_size,
+                        storage_size,
+                    ),
+                }
+            }
+        });
     }
 
     fn schedule_refresh(&mut self) {

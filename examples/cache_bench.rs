@@ -4,18 +4,17 @@
 //!
 //! **Phase 1 — DHT SET throughput** (real network, both clusters run sequentially)
 //!   Measures end-to-end write performance with and without the signature cache.
-//!   The cache pre-warms on `rpc_store`, so the first GET after a SET is already
-//!   a cache hit on the cached cluster.
 //!
-//! **Phase 2 — Signature verification micro-benchmark** (local storage only)
-//!   Records are written directly to `server.storage` — no network involved.
-//!   Then `server.get()` is called twice per record:
-//!   - Cold: cache miss → full Dilithium-2 verification (~100 µs)
-//!   - Warm: cache hit  → SHA-256 key lookup             (~1 µs)
-//!   Uncached cluster always pays full Dilithium-2 on both reads.
+//! **Phase 2 — Signature verification micro-benchmark** (no network)
+//!   Calls `DIDSignatureVerifierHandler::handle_signature_verification` directly
+//!   via `spawn_blocking`, mirroring the exact branching in `verify_for_key`:
 //!
-//!   This phase gives stable, reproducible numbers because it eliminates all
-//!   network variance from the GET measurement.
+//!   - Cold: SHA-256 key computed, cache miss → full Dilithium-2 via spawn_blocking
+//!           → result inserted into SignatureCache.
+//!   - Warm: SHA-256 key computed, cache hit → result returned directly, no spawn_blocking.
+//!   - Uncached: always pays full Dilithium-2, no cache involved.
+//!
+//!   This is faithful to the production code path and eliminates network variance.
 //!
 //! Run:
 //!   cargo run --release --example cache_bench
@@ -323,8 +322,19 @@ fn print_verify_table(label: &str, r: &VerifyResults) {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let parallelism = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+    tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(parallelism)
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(run());
+}
+
+async fn run() {
     let args: Vec<String> = std::env::args().collect();
     let num_ops: usize = args
         .get(1)

@@ -245,8 +245,19 @@ async fn print_topology(
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let parallelism = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+    tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(parallelism)
+        .enable_all()
+        .build()
+        .expect("failed to build Tokio runtime")
+        .block_on(run())
+}
+
+async fn run() {
     // Parse optional CLI args: topology_test [ksize] [alpha]
     let args: Vec<String> = std::env::args().collect();
     let ksize: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);

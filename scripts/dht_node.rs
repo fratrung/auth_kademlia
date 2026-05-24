@@ -282,8 +282,19 @@ async fn run_retriever(server: &Server) {
     );
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let parallelism = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+
+    tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(parallelism)
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let port: u16 = std::env::var("NODE_PORT")

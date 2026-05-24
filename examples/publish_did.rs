@@ -21,7 +21,6 @@ use std::time::Duration;
 use auth_kademlia_rs::auth_handler::DIDSignatureVerifierHandler;
 use auth_kademlia_rs::network::Server;
 
-// ─── Post-quantum primitives ──────────────────────────────────────────────────
 // These come from the `pqcrypto` family of crates.
 // Add to Cargo.toml:
 //   pqcrypto-dilithium = "0.5"
@@ -32,15 +31,10 @@ use pqcrypto_kyber::kyber512;
 use pqcrypto_traits::kem::PublicKey as KemPublicKey;
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 
-// ─── Encoding / JSON ──────────────────────────────────────────────────────────
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
 use tokio::time::sleep;
 use uuid::Uuid;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Record format helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Encode a raw public key as base64url (no padding).
 fn base64url_encode(pk: &[u8]) -> String {
@@ -101,10 +95,6 @@ fn build_signed_record(
     record.extend_from_slice(&doc_bytes);
     record
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DID Document builder
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Generate a `did:iiot` URI using a random UUID v4.
 fn generate_did_iiot() -> String {
@@ -173,8 +163,18 @@ async fn start_node(port: u16) -> Server {
     server
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let parallelism = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+    tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(parallelism)
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Start two local nodes
     let node_1 = start_node(5678).await;
     let node_2 = start_node(5679).await;
@@ -206,7 +206,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     sleep(Duration::from_secs(1)).await;
 
-    // --- Post-Quantum Cryptography Section ---
     // Generate PQC keypairs (Dilithium for signatures, Kyber for encryption)
     let (dilithium_pk, dilithium_sk) = dilithium2::keypair();
     let (kyber_pk, _) = kyber512::keypair();
@@ -243,7 +242,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // --- Verification Section ---
     // Node 1 attempts to retrieve the record published by Node 2
     println!(">>> Node 1: Retrieving record '{}'...", dht_key);
     match node_1.get(&dht_key).await {

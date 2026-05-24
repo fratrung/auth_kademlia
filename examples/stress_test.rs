@@ -491,8 +491,19 @@ async fn run_security_checks(nodes: &[Arc<Server>]) -> Vec<Check> {
 
 // ─── main ─────────────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let parallelism = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+    tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(parallelism)
+        .enable_all()
+        .build()
+        .expect("failed to build Tokio runtime")
+        .block_on(run())
+}
+
+async fn run() {
     let args: Vec<String> = std::env::args().collect();
     let num_ops: usize = args
         .get(1)

@@ -49,4 +49,8 @@ impl SignatureCache {
     pub fn insert(&self, value: &[u8], result: bool) {
         self.cache.insert(Self::compute_key(value), result);
     }
+
+    pub fn entry_count(&self) -> u64 {
+        self.cache.entry_count()
+    }
 }

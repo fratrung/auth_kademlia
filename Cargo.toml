@@ -68,6 +68,27 @@ pyo3-async-runtimes = { version = "0.21", features = ["tokio-runtime"], optional
 
 [dev-dependencies]
 tokio              = { version = "1", features = ["full", "test-util"] }
+futures            = "0.3"
 env_logger         = "0.11"
 pqcrypto-dilithium = "0.5"
 pqcrypto-traits    = "0.3"
+
+[[test]]
+name = "scenario_replication"
+path = "tests/scenarios/replication.rs"
+
+[[test]]
+name = "scenario_cache"
+path = "tests/scenarios/cache.rs"
+
+[[test]]
+name = "scenario_churn"
+path = "tests/scenarios/churn.rs"
+
+[[test]]
+name = "scenario_worker_pool"
+path = "tests/scenarios/worker_pool.rs"
+
+[[test]]
+name = "scenario_crypto"
+path = "tests/scenarios/crypto.rs"

@@ -72,9 +72,6 @@ fn build_signed_record(
     record
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DID Document builder
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Generate a `did:iiot` URI using a random UUID v4.
 fn generate_did_iiot() -> String {
@@ -131,8 +128,20 @@ mod tests {
     use super::*;
     use tokio::time::{sleep, Duration};
 
-    #[tokio::test]
-    async fn test_dht_publish_and_retrieve_detailed() {
+    #[test]
+    fn test_dht_publish_and_retrieve_detailed() {
+        let parallelism = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4);
+        tokio::runtime::Builder::new_multi_thread()
+            .max_blocking_threads(parallelism)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(test_body());
+    }
+
+    async fn test_body() {
         println!("\n--- Inizio Test DHT: Publish & Retrieve ---");
 
         // 1. Inizializza 3 nodi
