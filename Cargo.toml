@@ -12,6 +12,14 @@ crate-type = ["cdylib", "rlib"]
 name = "dht_node"
 path = "scripts/dht_node.rs"
 
+[[bin]]
+name = "resilience_victim"
+path = "scripts/resilience_victim.rs"
+
+[[bin]]
+name = "resilience_attacker"
+path = "scripts/resilience_attacker.rs"
+
 [features]
 default = []
 # Build the Python extension module:

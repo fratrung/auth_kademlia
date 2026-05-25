@@ -113,20 +113,137 @@ By inspecting fragments you can identify the internal composition of a PQC recor
 | **Replication filter** | On node join, only nodes XOR-closer to a key than the new node replicate it (Kademlia §2.5). Prevents redundant store RPCs from far-away nodes. |
 | **Atomic insert** | `rpc_store` uses a DashMap `Entry`-based `insert_if_absent` — eliminates the TOCTOU race window that existed with the old read-then-write pattern. |
 
+-----
+
+## Concurrency Architecture
+
+AuthKademlia-RS uses a two-layer concurrency model that separates
+**async I/O** (Tokio tasks) from **CPU-bound work** (OS blocking threads).
+Understanding the distinction matters on embedded hardware where both
+cores and memory are scarce.
+
+### Thread types
+
+| Type | Created by | Scheduled by | Count | Used for |
+|---|---|---|---|---|
+| **Worker thread** (OS) | Tokio runtime at startup | Kernel | `available_parallelism()` | Executing async tasks |
+| **Blocking thread** (OS) | Tokio on-demand | Kernel | ≤ `available_parallelism()` | Dilithium verification |
+| **Task** (coroutine) | `tokio::spawn` | Tokio scheduler | Many | All async logic |
+
+Worker threads and blocking threads are real OS threads visible to the
+kernel. Tasks are lightweight state machines allocated on the heap —
+they have no dedicated OS thread and consume no CPU when suspended on
+`.await`.
+
+### Runtime layout
+
+```
+Hardware proxy (N cores)
+│
+├─ Tokio worker threads  [OS threads, N = available_parallelism()]
+│   Each runs a loop:  pick next ready task → poll it → repeat
+│   Tasks yield at every .await, freeing the thread immediately.
+│
+└─ Tokio blocking pool  [OS threads, max = available_parallelism()]
+    Created on-demand for spawn_blocking (Dilithium verify/sign).
+    Capped via max_blocking_threads() — see runtime configuration.
+```
+
+### UDP receive pipeline
+
+```
+Network
+  │  UDP datagram arrives
+  ▼
+Kernel  ──epoll──►  Tokio wakes {recv loop task}
+                        │
+                        │  recv_from() → (bytes, peer)
+                        │  copy bytes into owned Vec
+                        │  try_send round-robin to worker channel
+                        │
+                        ▼
+              ┌─────────────────────────────────────────┐
+              │  mpsc channels  (256-slot each)         │
+              │  tx0 ──► [ ] [ ] [ ] ──► rx0            │
+              │  tx1 ──► [ ] [ ] [ ] ──► rx1            │
+              │  tx2 ──► [ ] [ ] [ ] ──► rx2            │
+              │  tx3 ──► [ ] [ ] [ ] ──► rx3            │
+              └─────────────────────────────────────────┘
+                        │
+                        ▼
+              {worker task 0..N}  (one per channel)
+                  rx.recv().await  — suspended when channel empty
+                        │
+                        ▼
+                  handle_datagram()
+                        │
+                        ├─ response / ping / find_node
+                        │   O(µs), no blocking work
+                        │   task completes, returns to rx.recv()
+                        │
+                        └─ store / update / delete
+                            verify_for_key()
+                              spawn_blocking(Dilithium)
+                              .await  ← task suspended, worker thread FREE
+                                          │
+                                          ▼
+                                    Blocking OS thread
+                                    Dilithium verify  (~5–50 ms on ARM)
+                                          │
+                                          ▼
+                              task resumes on any free worker thread
+                              storage.insert_if_absent()
+                              send_frame(response)
+```
+
+**Key property:** when a worker task suspends on `.await` — waiting for
+a channel, a lock, a network reply, or a blocking thread — the OS thread
+that was executing it is immediately reused for another task. At any
+given instant, the number of OS threads in use never exceeds
+`worker_threads + max_blocking_threads = 2 × available_parallelism()`.
+
+### Backpressure
+
+When all worker channels are full (all workers busy, all queues at 256
+entries) the recv loop suspends on `channel.send().await` instead of
+dropping the datagram or spawning an unbounded number of tasks. The
+system slows down gracefully under burst load without packet loss or
+memory growth.
+
+```
+Normal load:   recv_from → try_send → Ok  (O(1), no allocation)
+Burst load:    recv_from → try_send → Err (all full)
+                         → send().await   (recv loop suspended)
+                         ← worker drains one slot
+                         → resumes, inserts datagram
+```
+
+### Signature cache interaction
+
+The `SignatureCache` (moka, SHA-256 keyed, TTL 1 h) lifts most GET
+operations entirely out of the blocking pool:
+
+```
+GET cold:  SHA-256(record) → cache miss → spawn_blocking(Dilithium) → cache.insert
+GET warm:  SHA-256(record) → cache hit  → return immediately  (no blocking thread)
+```
+
+On a proxy that authenticates the same devices repeatedly, the warm
+path dominates and the blocking pool stays nearly idle.
+
+-----
+
+## Throughput & Benchmarks
+
 ### Throughput limits
 
 Each `set` → `get` round-trip includes a full Dilithium-2 signature verification
-(~5 ms CPU time on a modern x86 core). The blocking thread pool is capped at
-`available_parallelism()` threads, so peak verification throughput scales linearly
+(~5 ms CPU time on a modern x86 core). Peak verification throughput scales linearly
 with core count — approximately `N_cores / 5 ms` unique verifications per second.
 
-When the request rate exceeds drain capacity, the verification queue grows and RPC
-calls begin hitting the 5-second timeout. The `SignatureCache` substantially raises
-the practical ceiling: once a record has been verified once, subsequent reads return
-the cached result in O(1) time with no blocking work.
-
-Run `cargo run --release --example stress_test -- <ops> <concurrency>` to measure
-on your own hardware; results vary significantly with core count and clock speed.
+The `SignatureCache` substantially raises the practical ceiling: once a record has
+been verified once, subsequent reads return the cached result in O(1) time with no
+blocking work.
 
 ### Signature cache benchmark
 
@@ -140,9 +257,33 @@ The expected behaviour:
 - *GET warm*: cache hit → SHA-256(record) + `moka.get()` → result returned immediately. No blocking work. Speedup is proportional to the Dilithium-2 cost on the target hardware.
 - *DHT SET*: dominated by network round-trip; cache has negligible effect on write throughput.
 
-Run `cargo run --release --example cache_bench -- <ops> <concurrency>` to collect
-measurements on your own hardware. The cache can be disabled per-node by passing
-`use_cache: false` to `Server::new` for benchmarking or security auditing.
+Run `cargo run --release --example cache_bench` to collect measurements on your
+own hardware (fixed at 10 000 ops, c=30 for DHT SET; 500 ops sequential for the
+micro-benchmark). The cache can be disabled per-node by passing `use_cache: false`
+to `Server::new` for benchmarking or security auditing.
+
+### Resilience test (Docker)
+
+`resilience/` contains a Docker-based attack scenario that verifies crash resistance
+under sustained adversarial load without overwhelming the host machine.
+
+**Scenario:** a malicious Node B bootstraps with Node A, then floods it for 120 s
+with a mix of valid SETs, GET hits, GET misses, and invalid records
+(tampered Dilithium signature). Node A is capped at **2 CPU cores** to simulate
+an embedded edge device.
+
+```bash
+cd resilience
+docker compose up --build
+# Custom intensity:
+DURATION_SECS=300 CONCURRENCY=40 docker compose up --build
+```
+
+**Why Docker and not a single-process benchmark:** attacker and victim running in the
+same process share a Tokio runtime, so the attacker's CPU load directly degrades the
+victim's async executor — not a realistic model. Separate containers give each node
+its own runtime and let the OS scheduler arbitrate CPU time fairly, while
+`deploy.resources.limits.cpus` constrains Node A independently of Node B.
 
 -----
 

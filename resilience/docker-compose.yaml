@@ -1,0 +1,83 @@
+# Resilience test: malicious Node B floods Node A and we verify Node A survives.
+#
+# Node A (victim):
+#   - Seeds 5 DID records into local storage on startup.
+#   - Stays alive accepting incoming RPCs under load.
+#   - Limited to 2 CPU cores to simulate an embedded/edge node.
+#   - Memory cap 256 MB.
+#
+# Node B (attacker):
+#   - Bootstraps with Node A.
+#   - Pre-generates a pool of DID records (CPU-intensive, done once).
+#   - Floods Node A for DURATION_SECS seconds with a mix of:
+#       valid SET · GET hit · GET miss · invalid SET (tampered signature)
+#   - Concurrency is bounded by a Semaphore (CONCURRENCY env var) so the
+#     host PC is never overwhelmed regardless of attack intensity.
+#   - Prints a live stats table every 10 s and a final verdict on exit.
+#
+# Usage:
+#   cd resilience
+#   docker compose up --build            # default 120 s attack, 25 concurrent
+#   docker compose up --build -d         # detached; follow with: docker compose logs -f
+#
+# Tune the attack:
+#   DURATION_SECS=300 CONCURRENCY=40 docker compose up --build
+#
+# Clean up:
+#   docker compose down
+
+services:
+
+  # ── Node A — the victim ──────────────────────────────────────────────────────
+  node_a:
+    build:
+      context: ..                        # project root (where Cargo.toml lives)
+      dockerfile: resilience/Dockerfile
+      target: node_a
+    container_name: resilience_node_a
+    environment:
+      - NODE_PORT=5678
+      - SEED_COUNT=5
+      - RUST_LOG=info
+    # Resource limits simulate a constrained embedded / edge node.
+    # Reducing cpus makes the attack more visible in the logs.
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 256M
+    networks:
+      resilience_net:
+        ipv4_address: 172.21.0.10
+    # Expose the port so you can connect additional nodes or tools from the host.
+    ports:
+      - "15900:5678/udp"
+
+  # ── Node B — the attacker ────────────────────────────────────────────────────
+  node_b:
+    build:
+      context: ..
+      dockerfile: resilience/Dockerfile
+      target: node_b
+    container_name: resilience_node_b
+    environment:
+      - TARGET_ADDR=172.21.0.10:5678    # must match node_a's IP + NODE_PORT
+      - ATTACKER_PORT=5679
+      - POOL_SIZE=150                    # valid records pre-generated before attack
+      - CONCURRENCY=25                   # max in-flight ops (keeps host PC responsive)
+      - DURATION_SECS=120               # attack wall-clock duration in seconds
+      - RUST_LOG=warn
+    # Attacker is intentionally unconstrained: it should be able to saturate
+    # the victim's CPU budget without being throttled itself.
+    networks:
+      resilience_net:
+        ipv4_address: 172.21.0.11
+    depends_on:
+      - node_a
+
+networks:
+  resilience_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24

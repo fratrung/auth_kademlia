@@ -18,7 +18,7 @@
 //!
 //! Run:
 //!   cargo run --release --example cache_bench
-//!   cargo run --release --example cache_bench -- 500 20   # ops concurrency
+
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -54,8 +54,8 @@ const UNCACHED_PEER2: u16 = 15815;
 const MICRO_CACHED_PORT: u16 = 15816;
 const MICRO_UNCACHED_PORT: u16 = 15817;
 
-const DEFAULT_OPS: usize = 300;
-const DEFAULT_CONCURRENCY: usize = 20;
+const DEFAULT_OPS: usize = 10000;
+const DEFAULT_CONCURRENCY: usize = 30;
 // Micro-bench uses fewer ops: each op is sequential (~100 µs each), so 500
 // gives a stable average in < 0.1 s total per cluster.
 const MICRO_OPS: usize = 500;
@@ -335,20 +335,11 @@ fn main() {
 }
 
 async fn run() {
-    let args: Vec<String> = std::env::args().collect();
-    let num_ops: usize = args
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_OPS);
-    let concurrency: usize = args
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_CONCURRENCY);
 
     println!("╔═══════════════════════════════════════════════════════════╗");
     println!("║       AuthKademlia-RS  Signature Cache Benchmark          ║");
     println!("╚═══════════════════════════════════════════════════════════╝");
-    println!("  DHT SET : {num_ops} ops  c={concurrency}");
+    println!("  DHT SET : {DEFAULT_OPS} ops  c={DEFAULT_CONCURRENCY}");
     println!("  Verify  : {MICRO_OPS} ops  sequential  (local storage, no network)");
     println!("  Record  : ~6 KB  (Dilithium-2 + Kyber-512 DID Document)\n");
 
@@ -362,8 +353,8 @@ async fn run() {
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let cached_nodes = start_cluster(CACHED_SEED, CACHED_PEER1, CACHED_PEER2, true).await;
     println!("ok");
-    let cached_set = run_set_workload(&cached_nodes, num_ops, concurrency).await;
-    print_set_table("cached  ", &cached_set, num_ops);
+    let cached_set = run_set_workload(&cached_nodes, DEFAULT_OPS, DEFAULT_CONCURRENCY).await;
+    print_set_table("cached  ", &cached_set, DEFAULT_OPS);
 
     // Brief pause so OS reclaims sockets / CPU before next cluster starts.
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -373,8 +364,8 @@ async fn run() {
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let uncached_nodes = start_cluster(UNCACHED_SEED, UNCACHED_PEER1, UNCACHED_PEER2, false).await;
     println!("ok");
-    let uncached_set = run_set_workload(&uncached_nodes, num_ops, concurrency).await;
-    print_set_table("uncached", &uncached_set, num_ops);
+    let uncached_set = run_set_workload(&uncached_nodes, DEFAULT_OPS,DEFAULT_CONCURRENCY).await;
+    print_set_table("uncached", &uncached_set, DEFAULT_OPS);
 
     // SET comparison
     let set_c = avg_ns(&cached_set.set_ns);

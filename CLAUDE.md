@@ -177,7 +177,11 @@ All tests are network-clean (loopback only) and run in parallel without interfer
 
 When adding a new integration test use ports **15866+** and document them here.
 
+| 15900 | resilience test: Node A victim (host-exposed UDP, Docker only) |
+
 ## Docker
+
+### Demo (root `docker-compose.yaml`)
 ```
 docker compose up --build            # 4 containers: seed, peer1, peer2, peer3
 docker compose logs -f dht_peer_2   # follow a single container
@@ -185,6 +189,16 @@ docker compose logs -f dht_peer_2   # follow a single container
 `DEMO_DID_UUID` in `.env` is the shared key for the publisher→retriever demo.
 Environment variables per container: `NODE_PORT`, `IS_SEED`, `BOOTSTRAP_ADDR`,
 `ROLE` (`publisher`|`retriever`), `FIXED_DID_UUID`, `RETRIEVE_KEY`, `RUST_LOG`.
+
+### Resilience / attack test (`resilience/docker-compose.yaml`)
+```
+cd resilience
+docker compose up --build                         # 120 s attack, Node A capped at 2 cores
+DURATION_SECS=300 CONCURRENCY=40 docker compose up --build   # custom intensity
+```
+Node A (victim) pre-seeds 5 records; Node B (attacker) floods with valid/invalid
+SETs and GETs. Final report shows timeout rate and security verdict.
+See `resilience/README.md` for full details.
 
 ## Adding a new crypto algorithm
 1. Implement `SignatureVerifier` (and optionally `Signer`) in `src/crypto/<alg>.rs`.
