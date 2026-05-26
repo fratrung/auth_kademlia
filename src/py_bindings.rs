@@ -39,6 +39,7 @@ use std::sync::Arc;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use tokio::sync::RwLock;
 
 use crate::auth_handler::{DIDSignatureVerifierHandler, SignatureVerifierHandler};
@@ -167,7 +168,10 @@ impl PyServer {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let s = inner.read().await;
-            Ok(s.get(&key).await)
+            let result = s.get(&key).await;
+            Python::with_gil(|py| -> PyResult<Option<PyObject>> {
+                Ok(result.map(|v| PyBytes::new_bound(py, &v).into_py(py)))
+            })
         })
     }
 
@@ -332,10 +336,15 @@ impl PyDilithiumKeyManager {
     ///     security_level (int | None): Override the instance level (2, 3, or 5).
     ///                                  If omitted, the level set at construction is used.
     #[pyo3(signature = (security_level=None))]
-    fn generate_keypair(&self, security_level: Option<u8>) -> PyResult<(Vec<u8>, Vec<u8>)> {
+    fn generate_keypair<'py>(
+        &self,
+        py: Python<'py>,
+        security_level: Option<u8>,
+    ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
         let level = security_level.unwrap_or(self.inner.security_level);
         DilithiumKeyManager::new(self.inner.keys_dir.clone(), level)
             .generate_keypair()
+            .map(|(pk, sk)| (PyBytes::new_bound(py, &pk), PyBytes::new_bound(py, &sk)))
             .map_err(km_err)
     }
 
@@ -351,12 +360,16 @@ impl PyDilithiumKeyManager {
             .map_err(km_err)
     }
 
-    fn get_public_key(&self, key_name: String) -> PyResult<Vec<u8>> {
-        self.inner.get_public_key(&key_name).map_err(km_err)
+    fn get_public_key<'py>(&self, py: Python<'py>, key_name: String) -> PyResult<Bound<'py, PyBytes>> {
+        self.inner.get_public_key(&key_name)
+            .map(|v| PyBytes::new_bound(py, &v))
+            .map_err(km_err)
     }
 
-    fn get_private_key(&self, key_name: String) -> PyResult<Vec<u8>> {
-        self.inner.get_private_key(&key_name).map_err(km_err)
+    fn get_private_key<'py>(&self, py: Python<'py>, key_name: String) -> PyResult<Bound<'py, PyBytes>> {
+        self.inner.get_private_key(&key_name)
+            .map(|v| PyBytes::new_bound(py, &v))
+            .map_err(km_err)
     }
 
     /// Return a JWK-style ``dict`` for ``public_key``.
@@ -365,8 +378,10 @@ impl PyDilithiumKeyManager {
     }
 
     /// Sign ``message`` with ``private_key``. Returns raw signature bytes.
-    fn sign(&self, private_key: Vec<u8>, message: Vec<u8>) -> PyResult<Vec<u8>> {
-        self.inner.sign(&private_key, &message).map_err(km_err)
+    fn sign<'py>(&self, py: Python<'py>, private_key: Vec<u8>, message: Vec<u8>) -> PyResult<Bound<'py, PyBytes>> {
+        self.inner.sign(&private_key, &message)
+            .map(|v| PyBytes::new_bound(py, &v))
+            .map_err(km_err)
     }
 
     /// Verify ``signature`` over ``message`` against ``public_key``.
@@ -406,10 +421,15 @@ impl PyKyberKeyManager {
     /// Args:
     ///     security_level (int | None): Override the instance level (512, 768, or 1024).
     #[pyo3(signature = (security_level=None))]
-    fn generate_keypair(&self, security_level: Option<u16>) -> PyResult<(Vec<u8>, Vec<u8>)> {
+    fn generate_keypair<'py>(
+        &self,
+        py: Python<'py>,
+        security_level: Option<u16>,
+    ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
         let level = security_level.unwrap_or(self.inner.security_level);
         KyberKeyManager::new(self.inner.keys_dir.clone(), level)
             .generate_keypair()
+            .map(|(pk, sk)| (PyBytes::new_bound(py, &pk), PyBytes::new_bound(py, &sk)))
             .map_err(km_err)
     }
 
@@ -425,12 +445,16 @@ impl PyKyberKeyManager {
             .map_err(km_err)
     }
 
-    fn get_public_key(&self, key_name: String) -> PyResult<Vec<u8>> {
-        self.inner.get_public_key(&key_name).map_err(km_err)
+    fn get_public_key<'py>(&self, py: Python<'py>, key_name: String) -> PyResult<Bound<'py, PyBytes>> {
+        self.inner.get_public_key(&key_name)
+            .map(|v| PyBytes::new_bound(py, &v))
+            .map_err(km_err)
     }
 
-    fn get_private_key(&self, key_name: String) -> PyResult<Vec<u8>> {
-        self.inner.get_private_key(&key_name).map_err(km_err)
+    fn get_private_key<'py>(&self, py: Python<'py>, key_name: String) -> PyResult<Bound<'py, PyBytes>> {
+        self.inner.get_private_key(&key_name)
+            .map(|v| PyBytes::new_bound(py, &v))
+            .map_err(km_err)
     }
 
     fn get_jose_format(&self, public_key: Vec<u8>) -> HashMap<String, String> {
@@ -456,8 +480,10 @@ impl PyEd25519KeyManager {
         }
     }
 
-    fn generate_keypair(&self) -> PyResult<(Vec<u8>, Vec<u8>)> {
-        self.inner.generate_keypair().map_err(km_err)
+    fn generate_keypair<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+        self.inner.generate_keypair()
+            .map(|(pk, sk)| (PyBytes::new_bound(py, &pk), PyBytes::new_bound(py, &sk)))
+            .map_err(km_err)
     }
 
     fn store_public_key(&self, key_name: String, public_key: Vec<u8>) -> PyResult<()> {
@@ -472,20 +498,26 @@ impl PyEd25519KeyManager {
             .map_err(km_err)
     }
 
-    fn get_public_key(&self, key_name: String) -> PyResult<Vec<u8>> {
-        self.inner.get_public_key(&key_name).map_err(km_err)
+    fn get_public_key<'py>(&self, py: Python<'py>, key_name: String) -> PyResult<Bound<'py, PyBytes>> {
+        self.inner.get_public_key(&key_name)
+            .map(|v| PyBytes::new_bound(py, &v))
+            .map_err(km_err)
     }
 
-    fn get_private_key(&self, key_name: String) -> PyResult<Vec<u8>> {
-        self.inner.get_private_key(&key_name).map_err(km_err)
+    fn get_private_key<'py>(&self, py: Python<'py>, key_name: String) -> PyResult<Bound<'py, PyBytes>> {
+        self.inner.get_private_key(&key_name)
+            .map(|v| PyBytes::new_bound(py, &v))
+            .map_err(km_err)
     }
 
     fn get_jose_format(&self, public_key: Vec<u8>) -> HashMap<String, String> {
         self.inner.get_jose_format(&public_key)
     }
 
-    fn sign(&self, private_key: Vec<u8>, message: Vec<u8>) -> PyResult<Vec<u8>> {
-        self.inner.sign(&private_key, &message).map_err(km_err)
+    fn sign<'py>(&self, py: Python<'py>, private_key: Vec<u8>, message: Vec<u8>) -> PyResult<Bound<'py, PyBytes>> {
+        self.inner.sign(&private_key, &message)
+            .map(|v| PyBytes::new_bound(py, &v))
+            .map_err(km_err)
     }
 
     fn verify_signature(
@@ -500,6 +532,29 @@ impl PyEd25519KeyManager {
     }
 }
 
+/// Initialise the Tokio runtime with a bounded blocking thread pool.
+///
+/// Must be called **once** before creating any ``Server`` instance, ideally at
+/// the very start of ``main()`` or the application entry point.
+///
+/// Without this call, ``pyo3-async-runtimes`` creates a default runtime with
+/// ``max_blocking_threads = 512``, which causes excessive context switching
+/// during Dilithium verifications (CPU-bound ``spawn_blocking`` tasks) on
+/// constrained hardware with few physical cores.
+///
+/// After calling this, ``max_blocking_threads`` equals the number of physical
+/// cores reported by the OS — optimal for Dilithium parallelism on edge nodes.
+#[pyfunction]
+fn init_runtime() {
+    let parallelism = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.max_blocking_threads(parallelism).enable_all();
+    pyo3_async_runtimes::tokio::init(builder);
+}
+
 /// Python module entry point.
 ///
 /// The function name **must** match the desired module name so that Python
@@ -508,6 +563,7 @@ impl PyEd25519KeyManager {
 /// ``pyproject.toml`` to produce the correctly-named ``.so`` file.
 #[pymodule]
 fn authkademlia_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(init_runtime, m)?)?;
     m.add_class::<PyServer>()?;
     m.add_class::<PyDilithiumKeyManager>()?;
     m.add_class::<PyKyberKeyManager>()?;

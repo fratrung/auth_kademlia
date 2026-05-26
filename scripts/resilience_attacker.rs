@@ -343,7 +343,6 @@ async fn run() {
         .unwrap();
     println!("done ({:.1}s)\n", t.elapsed().as_secs_f64());
 
-    // ── Phase 1: STORE valid records ─────────────────────────────────────────
     println!("[attacker] Phase 1 — STORE {} valid records  (concurrency={concurrency})",
              valid_pool.len());
     let t1 = Instant::now();
@@ -353,7 +352,6 @@ async fn run() {
     print_latency("store-valid", &mut lat1, wall1, accepted, rejected, store_timeout);
     println!();
 
-    // ── Phase 2: STORE invalid records ───────────────────────────────────────
     println!("[attacker] Phase 2 — STORE {} invalid records  (concurrency={concurrency})",
              invalid_pool.len());
     let t2 = Instant::now();
@@ -363,7 +361,6 @@ async fn run() {
     print_latency("store-invalid", &mut lat2, wall2, inv_accepted, inv_rejected, inv_timeout);
     println!();
 
-    // ── Phase 3: GET verify stored keys ──────────────────────────────────────
     // The victim may have been evicted from the routing table while under load
     // during Phase 2 (background ping tasks time out → remove from router).
     // Re-bootstrap to restore the routing table before issuing GET requests.
@@ -392,7 +389,6 @@ async fn run() {
     }
     println!();
 
-    // ── Verdict ───────────────────────────────────────────────────────────────
     println!("━━━ Resilience verdict ━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
     if inv_accepted == 0 {

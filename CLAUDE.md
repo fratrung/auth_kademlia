@@ -28,6 +28,18 @@ Python extension (maturin, optional — do not use in Rust-only deployments):
 maturin develop --features python
 ```
 
+### Python binding usage notes (`src/py_bindings.rs`)
+
+- **`init_runtime()`** must be called once before creating any `Server` instance.
+  It builds a Tokio runtime with `max_blocking_threads = available_parallelism()`
+  and passes the `Builder` to `pyo3_async_runtimes::tokio::init`. Without this
+  call the default cap is 512 blocking threads, causing CPU thrashing on low-core
+  nodes during Dilithium `spawn_blocking` calls.
+- All methods returning binary data (`get_public_key`, `get_private_key`, `sign`,
+  `generate_keypair`) return `PyBytes` / `(PyBytes, PyBytes)` — Python callers
+  receive native `bytes` objects directly, no implicit list conversion.
+- `Server.get()` returns `bytes | None` (not `list | None`).
+
 ## Tokio runtime — caller responsibility
 
 `auth_kademlia_rs` does **not** create a Tokio runtime. The caller must build one and

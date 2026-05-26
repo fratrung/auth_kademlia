@@ -321,7 +321,7 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-authkademlia-rs = { git = "https://github.com/fratrung/auth_kademlia" }
+authkademlia-rs = { git = "https://github.com/fratrung/auth-kademlia-rs" }
 ```
 
 -----
