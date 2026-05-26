@@ -262,22 +262,36 @@ own hardware (fixed at 10 000 ops, c=30 for DHT SET; 500 ops sequential for the
 micro-benchmark). The cache can be disabled per-node by passing `use_cache: false`
 to `Server::new` for benchmarking or security auditing.
 
-### Resilience test (Docker)
+### Resilience &amp; robustness tests (Docker)
 
-`resilience/` contains a Docker-based attack scenario that verifies crash resistance
-under sustained adversarial load without overwhelming the host machine.
+`resilience/` contains three Docker-based scenarios that measure crash resistance,
+security invariants, and performance degradation under adversarial load.
+Node A is capped at **2 CPU cores / 256 MB RAM** to simulate a constrained
+embedded edge device; Node B is unconstrained so it can fully saturate Node A's
+CPU budget.
 
-**Scenario:** a malicious Node B bootstraps with Node A, then floods it for 120 s
-with a mix of valid SETs, GET hits, GET misses, and invalid records
-(tampered Dilithium signature). Node A is capped at **2 CPU cores** to simulate
-an embedded edge device.
+| Scenario | Tool | Purpose |
+|----------|------|---------|
+| Single adversarial run | `docker compose up --build` | Verify security invariants and basic survivability |
+| Statistical benchmark | `run_stats.py` | N runs with mean, std, and Student-t confidence intervals |
+| Degradation sweep | `degradation_sweep.py` | Acceptance rate, p95 latency and throughput vs attacker concurrency |
 
 ```bash
 cd resilience
+
+# single run
 docker compose up --build
-# Custom intensity:
-DURATION_SECS=300 CONCURRENCY=40 docker compose up --build
+
+# 10-run statistical analysis (95 % CI)
+python3 run_stats.py --no-build
+
+# degradation curve across concurrency levels
+python3 degradation_sweep.py --no-build
 ```
+
+See **[`resilience/README.md`](resilience/README.md)** for full documentation:
+test methodology, metric definitions, expected degradation behaviour, environment
+variables, and output format.
 
 **Why Docker and not a single-process benchmark:** attacker and victim running in the
 same process share a Tokio runtime, so the attacker's CPU load directly degrades the

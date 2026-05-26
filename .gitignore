@@ -17,3 +17,8 @@ Cargo.lock
 
 issuer.bin
 TASKS.md
+stats_result.md
+stats.json
+docker-compose.override.yml
+degradation.json
+

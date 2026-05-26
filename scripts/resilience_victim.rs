@@ -1,18 +1,13 @@
 /// Resilience test — Node A (victim / seed).
 ///
-/// Seeds SEED_COUNT valid DID records directly into local storage, then stays
-/// alive accepting incoming RPCs. Designed to be flooded by `resilience_attacker`.
+/// Seeds `SEED_COUNT` valid DID records directly into local storage, waits for
+/// Node B to bootstrap, then stays alive accepting RPCs for `LIFETIME_SECS`.
 ///
 /// Environment variables:
-///   NODE_PORT   — UDP port (default: 5678)
-///   SEED_COUNT  — records to pre-seed (default: 5)
-///   RUST_LOG    — log level (default: info)
-///
-/// Run standalone:
-///   cargo run --release --bin resilience_victim
-///
-/// Run via Docker:
-///   docker compose -f resilience/docker-compose.yaml up
+///   NODE_PORT      — UDP port (default: 5678)
+///   SEED_COUNT     — records to pre-seed (default: 5)
+///   LIFETIME_SECS  — auto-shutdown after N seconds (default: 180)
+///   RUST_LOG       — log level (default: warn)
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,12 +26,11 @@ use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-// ─── DID record helpers ───────────────────────────────────────────────────────
-
 fn b64url(data: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(data)
 }
 
+/// Sorts object keys recursively so the JSON is canonical before signing.
 fn sort_json(v: &Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(
@@ -51,7 +45,7 @@ fn sort_json(v: &Value) -> Value {
     }
 }
 
-/// Build a valid self-signed DID record (wire format: alg || sig || doc_json).
+/// Builds a valid self-signed Dilithium-2 DID record (wire format: alg ‖ sig ‖ doc).
 fn make_record() -> (String, Vec<u8>) {
     let (dpk, dsk) = dilithium2::keypair();
     let (kpk, _) = kyber512::keypair();
@@ -86,19 +80,16 @@ fn make_record() -> (String, Vec<u8>) {
 
     let doc_bytes = serde_json::to_vec(&sort_json(&doc)).unwrap();
     let sig = dilithium2::detached_sign(&doc_bytes, &dsk);
-    let sig_bytes = sig.as_bytes();
 
     let mut alg = [0u8; 12];
     alg[..11].copy_from_slice(b"Dilithium-2");
 
-    let mut record = Vec::with_capacity(12 + sig_bytes.len() + doc_bytes.len());
+    let mut record = Vec::with_capacity(12 + sig.as_bytes().len() + doc_bytes.len());
     record.extend_from_slice(&alg);
-    record.extend_from_slice(sig_bytes);
+    record.extend_from_slice(sig.as_bytes());
     record.extend_from_slice(&doc_bytes);
     (key, record)
 }
-
-// ─── main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
     let parallelism = std::thread::available_parallelism()
@@ -113,95 +104,82 @@ fn main() {
 }
 
 async fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let port: u16 = std::env::var("NODE_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5678);
-
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(5678);
     let seed_count: usize = std::env::var("SEED_COUNT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let lifetime_secs: u64 = std::env::var("LIFETIME_SECS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(180);
 
     println!("╔══════════════════════════════════════════════╗");
     println!("║     AuthKademlia-RS  Resilience Victim       ║");
     println!("╚══════════════════════════════════════════════╝");
-    println!("  Port        : {port}");
-    println!("  Seed records: {seed_count}");
+    println!("  Port      : {port}");
+    println!("  Seeds     : {seed_count}");
+    println!("  Lifetime  : {lifetime_secs}s");
     println!();
 
-    let issuer_path = PathBuf::from("issuer.bin");
-    if !issuer_path.exists() {
-        log::warn!(
-            "issuer.bin not found — STATUS_LIST_KEY verification disabled. \
-             Normal DID record operations unaffected."
-        );
-    }
-
-    let handler = Arc::new(DIDSignatureVerifierHandler::new(issuer_path));
-    let mut server = Server::new(handler, 20, 3, None, None, true);
-    server
-        .listen(port, "0.0.0.0")
-        .await
-        .expect("failed to bind UDP socket");
-
+    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
+    let mut server = Server::new(handler, 20, 3, None, None, false);
+    server.listen(port, "0.0.0.0").await.expect("failed to bind UDP socket");
     println!("[victim] Listening on 0.0.0.0:{port}");
 
-    // Seed records directly into local storage.
-    // The node is alone at startup (no peers yet), so calling server.set()
-    // would fail because set_digest() requires at least one reachable neighbor.
-    // Direct storage insertion bypasses the DHT layer — correct for a seed node.
-    println!("[victim] Seeding {seed_count} records into local storage...");
+    println!("[victim] Waiting for attacker to bootstrap...");
+    loop {
+        if !server.bootstrappable_neighbors().await.is_empty() {
+            println!("[victim] Attacker connected — seeding records.");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
-    // Generate keypairs in a blocking thread (CPU-intensive, ~10ms per record).
+    // Dilithium keypair generation is CPU-intensive; offloaded to avoid blocking the runtime.
     let records: Vec<(String, Vec<u8>)> =
         tokio::task::spawn_blocking(move || (0..seed_count).map(|_| make_record()).collect())
             .await
             .unwrap();
 
-    for (i, (key, record)) in records.iter().enumerate() {
-        let dkey = digest(key);
-        server.storage.set(dkey.to_vec(), record.clone());
-        println!(
-            "[victim]   record {}/{} stored  key={}…",
-            i + 1,
-            seed_count,
-            &key[..8]
-        );
+    for (key, record) in &records {
+        server.storage.set(digest(key).to_vec(), record.clone());
     }
+    println!("[victim] Seeded {seed_count} records. Ready.\n");
 
-    println!("[victim] READY — {seed_count} records seeded. Awaiting incoming attack.\n");
-
-    // Periodic health ticker: prints storage size every 30 s so Docker logs
-    // show that Node A is alive and responsive even under load.
+    // Emit a storage snapshot every 30 s so Docker logs show the node is alive under load.
     let storage_ref = Arc::clone(&server.storage);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
-            let count = storage_ref.iter_all().len();
-            println!("[victim] [health] storage={count} records — node alive");
+            println!("[victim] storage={} records", storage_ref.iter_all().len());
         }
     });
 
-    // Wait for SIGTERM (Docker stop) or SIGINT (Ctrl-C).
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
         let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler failed");
         tokio::select! {
-            _ = sigterm.recv()           => {}
-            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv()                                          => {}
+            _ = tokio::signal::ctrl_c()                                => {}
+            _ = tokio::time::sleep(Duration::from_secs(lifetime_secs)) => {
+                println!("[victim] Lifetime elapsed — shutting down.");
+            }
         }
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await.ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c()                                => {}
+            _ = tokio::time::sleep(Duration::from_secs(lifetime_secs)) => {
+                println!("[victim] Lifetime elapsed — shutting down.");
+            }
+        }
     }
 
-    println!("[victim] Shutdown signal received — stopping.");
+    let final_count = server.storage.iter_all().len();
+    println!("[victim] Final storage: {final_count} records (seeded {seed_count}).");
     server.stop().await;
     println!("[victim] Stopped.");
 }

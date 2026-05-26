@@ -827,8 +827,10 @@ impl KademliaProtocol {
         })
         .await
         .unwrap_or(false);
-        if let (Some(cache), Some(ck)) = (&self.sig_cache, cache_key) {
-            cache.insert_by_key(ck, result);
+        if result {
+            if let (Some(cache), Some(ck)) = (&self.sig_cache, cache_key) {
+                cache.insert_by_key(ck, result);
+            }
         }
         result
     }

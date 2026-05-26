@@ -28,7 +28,6 @@
 
 services:
 
-  # ── Node A — the victim ──────────────────────────────────────────────────────
   node_a:
     build:
       context: ..                        # project root (where Cargo.toml lives)
@@ -38,6 +37,7 @@ services:
     environment:
       - NODE_PORT=5678
       - SEED_COUNT=5
+      - LIFETIME_SECS=300
       - RUST_LOG=info
     # Resource limits simulate a constrained embedded / edge node.
     # Reducing cpus makes the attack more visible in the logs.
@@ -53,7 +53,6 @@ services:
     ports:
       - "15900:5678/udp"
 
-  # ── Node B — the attacker ────────────────────────────────────────────────────
   node_b:
     build:
       context: ..
@@ -63,9 +62,8 @@ services:
     environment:
       - TARGET_ADDR=172.21.0.10:5678    # must match node_a's IP + NODE_PORT
       - ATTACKER_PORT=5679
-      - POOL_SIZE=150                    # valid records pre-generated before attack
-      - CONCURRENCY=25                   # max in-flight ops (keeps host PC responsive)
-      - DURATION_SECS=120               # attack wall-clock duration in seconds
+      - POOL_SIZE=500                    # valid records (invalid pool = POOL_SIZE/50 ≥ 10)
+      - CONCURRENCY=50                   # max in-flight RPCs per phase — intentionally high
       - RUST_LOG=warn
     # Attacker is intentionally unconstrained: it should be able to saturate
     # the victim's CPU budget without being throttled itself.

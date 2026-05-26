@@ -1,32 +1,29 @@
-/// Resilience test — Node B (attacker / malicious node).
+/// Resilience test — Node B (attacker).
 ///
-/// Bootstraps with Node A, pre-generates a pool of DID records, then floods
-/// Node A with a sustained mix of:
-///   45 % valid SET   (unique records from pre-generated pool)
-///   25 % GET hit     (keys the attacker successfully stored)
-///   20 % GET miss    (random UUIDs guaranteed to be absent)
-///   10 % invalid SET (valid record with one signature byte flipped)
+/// Runs three sequential phases against Node A:
+///   1. STORE valid    — sends `POOL_SIZE` valid DID records; reports latency distribution.
+///   2. STORE invalid  — sends `POOL_SIZE/3` tampered records (one sig byte flipped);
+///                       every acceptance is a security failure.
+///   3. GET verify     — retrieves every key accepted in phase 1; reports latency distribution.
 ///
-/// After the valid pool is exhausted, the op mix shifts to GET / invalid SET.
-/// All ops are bound by a Semaphore so the host PC is never overwhelmed.
+/// Each record is sent exactly once. Concurrency is bounded by `CONCURRENCY`.
+/// Per-RPC latency is collected and reported as min/avg/p95/max + throughput (ops/sec).
 ///
 /// Environment variables:
-///   TARGET_ADDR    — Node A address (default: 172.21.0.10:5678)
-///   ATTACKER_PORT  — Node B's own UDP port (default: 5679)
-///   POOL_SIZE      — valid records to pre-generate (default: 150)
-///   CONCURRENCY    — max in-flight ops (default: 25)
-///   DURATION_SECS  — attack wall-clock duration (default: 120)
-///   RUST_LOG       — log level (default: warn)
-///
-/// Run via Docker:
-///   docker compose -f resilience/docker-compose.yaml up
+///   TARGET_ADDR   — Node A address (default: 172.21.0.10:5678)
+///   ATTACKER_PORT — Node B's own UDP port (default: 5679)
+///   POOL_SIZE     — valid records to generate (default: 300)
+///   CONCURRENCY   — max in-flight RPCs per phase (default: 50)
+///   RUST_LOG      — log level (default: warn)
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use auth_kademlia_rs::auth_handler::DIDSignatureVerifierHandler;
 use auth_kademlia_rs::network::Server;
+use auth_kademlia_rs::node::Node;
+use auth_kademlia_rs::protocol::KademliaProtocol;
+use auth_kademlia_rs::utils::digest;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -35,97 +32,67 @@ use pqcrypto_kyber::kyber512;
 use pqcrypto_traits::kem::PublicKey as KemPublicKey;
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 use serde_json::{json, Value};
-use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-const OP_TIMEOUT: Duration = Duration::from_secs(10);
-const STATS_INTERVAL: Duration = Duration::from_secs(10);
-// Invalid pool is 1/3 the valid pool size (cycled with modulo).
-const INVALID_RATIO: usize = 3;
+// Must be strictly less than the protocol's internal RPC_TIMEOUT (5 s) so that
+// when the victim doesn't respond in time this outer timeout fires first and
+// the result is counted as timed_out rather than rejected.
+const RPC_TIMEOUT: Duration = Duration::from_millis(4500);
 
-// ─── Stats ────────────────────────────────────────────────────────────────────
 
-#[derive(Default)]
-struct Stats {
-    set_ok: AtomicUsize,
-    set_rejected: AtomicUsize,
-    set_timeout: AtomicUsize,
-    get_hit: AtomicUsize,
-    get_miss: AtomicUsize,
-    get_timeout: AtomicUsize,
-    /// Records with a tampered signature that node A rejected (expected: all).
-    invalid_rejected: AtomicUsize,
-    /// Records with a tampered signature that node A accepted (security failure!).
-    invalid_accepted: AtomicUsize,
+struct LatencyStats {
+    samples: Vec<Duration>,
 }
 
-impl Stats {
-    fn snapshot(&self) -> StatsSnap {
-        StatsSnap {
-            set_ok: self.set_ok.load(Ordering::Relaxed),
-            set_rej: self.set_rejected.load(Ordering::Relaxed),
-            set_to: self.set_timeout.load(Ordering::Relaxed),
-            get_hit: self.get_hit.load(Ordering::Relaxed),
-            get_miss: self.get_miss.load(Ordering::Relaxed),
-            get_to: self.get_timeout.load(Ordering::Relaxed),
-            inv_rej: self.invalid_rejected.load(Ordering::Relaxed),
-            inv_acc: self.invalid_accepted.load(Ordering::Relaxed),
-        }
+impl LatencyStats {
+    fn new() -> Self {
+        Self { samples: Vec::new() }
     }
 
-    fn print(&self, elapsed_secs: f64, label: &str) {
-        let s = self.snapshot();
-        let total = s.set_ok + s.set_rej + s.set_to
-            + s.get_hit + s.get_miss + s.get_to
-            + s.inv_rej + s.inv_acc;
-        let tps = if elapsed_secs > 0.0 {
-            total as f64 / elapsed_secs
-        } else {
-            0.0
-        };
-        let security_flag = if s.inv_acc > 0 {
-            format!("  ← !! SECURITY FAILURE: {} invalid accepted !!", s.inv_acc)
-        } else {
-            String::new()
-        };
+    fn push(&mut self, d: Duration) {
+        self.samples.push(d);
+    }
+
+    /// Returns (min, avg, p95, max, ops_per_sec) over `wall` elapsed time.
+    fn report(&mut self, wall: Duration) -> (f64, f64, f64, f64, f64) {
+        if self.samples.is_empty() {
+            return (0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+        self.samples.sort_unstable();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let min = ms(*self.samples.first().unwrap());
+        let max = ms(*self.samples.last().unwrap());
+        let avg = self.samples.iter().map(|d| ms(*d)).sum::<f64>() / self.samples.len() as f64;
+        let p95_idx = ((self.samples.len() as f64 * 0.95) as usize).min(self.samples.len() - 1);
+        let p95 = ms(self.samples[p95_idx]);
+        let tps = self.samples.len() as f64 / wall.as_secs_f64();
+        (min, avg, p95, max, tps)
+    }
+}
+
+fn print_latency(label: &str, stats: &mut LatencyStats, wall: Duration,
+                 accepted: usize, rejected: usize, timed_out: usize) {
+    let (min, avg, p95, max, tps) = stats.report(wall);
+    println!(
+        "  accepted={accepted}  rejected={rejected}  timeout={timed_out}  \
+         ({:.1}s  {tps:.1} ops/s)",
+        wall.as_secs_f64()
+    );
+    if !stats.samples.is_empty() {
         println!(
-            "[attacker] {:<22} {:>5.0}s  {total:>5} ops  {tps:>5.1}/s\n\
-             [attacker]   SET  ok={:<5} rejected={:<5} timeout={}\n\
-             [attacker]   GET  hit={:<5} miss={:<5}    timeout={}\n\
-             [attacker]   INV  rejected={:<5} accepted={}{security_flag}\n",
-            label,
-            elapsed_secs,
-            s.set_ok,
-            s.set_rej,
-            s.set_to,
-            s.get_hit,
-            s.get_miss,
-            s.get_to,
-            s.inv_rej,
-            s.inv_acc,
+            "  latency [{label}]  min={min:.1}ms  avg={avg:.1}ms  p95={p95:.1}ms  max={max:.1}ms"
         );
     }
 }
 
-struct StatsSnap {
-    set_ok: usize,
-    set_rej: usize,
-    set_to: usize,
-    get_hit: usize,
-    get_miss: usize,
-    get_to: usize,
-    inv_rej: usize,
-    inv_acc: usize,
-}
-
-// ─── DID record helpers ───────────────────────────────────────────────────────
 
 fn b64url(data: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(data)
 }
 
+/// Sorts object keys recursively so the JSON is canonical before signing.
 fn sort_json(v: &Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(
@@ -140,6 +107,7 @@ fn sort_json(v: &Value) -> Value {
     }
 }
 
+/// Builds a valid self-signed Dilithium-2 DID record (wire format: alg ‖ sig ‖ doc).
 fn make_record() -> (String, Vec<u8>) {
     let (dpk, dsk) = dilithium2::keypair();
     let (kpk, _) = kyber512::keypair();
@@ -174,29 +142,121 @@ fn make_record() -> (String, Vec<u8>) {
 
     let doc_bytes = serde_json::to_vec(&sort_json(&doc)).unwrap();
     let sig = dilithium2::detached_sign(&doc_bytes, &dsk);
-    let sig_bytes = sig.as_bytes();
 
     let mut alg = [0u8; 12];
     alg[..11].copy_from_slice(b"Dilithium-2");
 
-    let mut record = Vec::with_capacity(12 + sig_bytes.len() + doc_bytes.len());
+    let mut record = Vec::with_capacity(12 + sig.as_bytes().len() + doc_bytes.len());
     record.extend_from_slice(&alg);
-    record.extend_from_slice(sig_bytes);
+    record.extend_from_slice(sig.as_bytes());
     record.extend_from_slice(&doc_bytes);
     (key, record)
 }
 
-// ─── Op type ─────────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
-enum Op {
-    SetValid { key: String, record: Vec<u8> },
-    GetKnown { key: String },
-    GetMiss { key: String },
-    SetInvalid { key: String, record: Vec<u8> },
+/// Sends every (key, record) pair to `victim` via `call_store_rpc`, bounded by `concurrency`.
+/// Returns `(accepted, rejected, timed_out, accepted_keys, latency_stats)`.
+async fn store_phase(
+    proto: Arc<KademliaProtocol>,
+    victim: Node,
+    pool: Vec<(String, Vec<u8>)>,
+    concurrency: usize,
+) -> (usize, usize, usize, Vec<String>, LatencyStats) {
+    // (timed_out: bool, accepted: bool, key, elapsed)
+    let mut jset: JoinSet<(bool, bool, String, Duration)> = JoinSet::new();
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+    let mut timed_out = 0usize;
+    let mut accepted_keys: Vec<String> = Vec::new();
+    let mut latency = LatencyStats::new();
+    let mut iter = pool.into_iter();
+
+    loop {
+        while jset.len() < concurrency {
+            match iter.next() {
+                Some((key, record)) => {
+                    let p = Arc::clone(&proto);
+                    let v = victim.clone();
+                    let k = key.clone();
+                    jset.spawn(async move {
+                        let dkey = digest(&k);
+                        let t = Instant::now();
+                        match timeout(RPC_TIMEOUT, p.call_store_rpc(&v, dkey, record)).await {
+                            Ok(ok) => (false, ok, k, t.elapsed()),
+                            Err(_)  => (true, false, k, t.elapsed()),
+                        }
+                    });
+                }
+                None => break,
+            }
+        }
+        if jset.is_empty() {
+            break;
+        }
+        match jset.join_next().await {
+            Some(Ok((is_timeout, ok, key, elapsed))) => {
+                latency.push(elapsed);
+                if is_timeout {
+                    timed_out += 1;
+                } else if ok {
+                    accepted += 1;
+                    accepted_keys.push(key);
+                } else {
+                    rejected += 1;
+                }
+            }
+            _ => timed_out += 1,
+        }
+    }
+    (accepted, rejected, timed_out, accepted_keys, latency)
 }
 
-// ─── main ─────────────────────────────────────────────────────────────────────
+/// Retrieves each key from the DHT via `server.get()`, bounded by `concurrency`.
+/// Returns `(hits, misses, timed_out, latency_stats)`.
+async fn get_phase(
+    server: Arc<Server>,
+    keys: Vec<String>,
+    concurrency: usize,
+) -> (usize, usize, usize, LatencyStats) {
+    let mut jset: JoinSet<(bool, Duration)> = JoinSet::new();
+    let mut hits = 0usize;
+    let mut misses = 0usize;
+    let mut timed_out = 0usize;
+    let mut latency = LatencyStats::new();
+    let mut iter = keys.into_iter();
+
+    loop {
+        while jset.len() < concurrency {
+            match iter.next() {
+                Some(key) => {
+                    let s = Arc::clone(&server);
+                    jset.spawn(async move {
+                        let t = Instant::now();
+                        let found = timeout(RPC_TIMEOUT, s.get(&key))
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some();
+                        (found, t.elapsed())
+                    });
+                }
+                None => break,
+            }
+        }
+        if jset.is_empty() {
+            break;
+        }
+        match jset.join_next().await {
+            Some(Ok((found, elapsed))) => {
+                latency.push(elapsed);
+                if found { hits += 1; } else { misses += 1; }
+            }
+            _ => timed_out += 1,
+        }
+    }
+    (hits, misses, timed_out, latency)
+}
+
 
 fn main() {
     let parallelism = std::thread::available_parallelism()
@@ -213,312 +273,197 @@ fn main() {
 async fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    // ── Configuration ─────────────────────────────────────────────────────────
     let target_addr = std::env::var("TARGET_ADDR")
         .unwrap_or_else(|_| "172.21.0.10:5678".to_string());
     let attacker_port: u16 = std::env::var("ATTACKER_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5679);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(5679);
     let pool_size: usize = std::env::var("POOL_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(150);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(300);
     let concurrency: usize = std::env::var("CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(25);
-    let duration_secs: u64 = std::env::var("DURATION_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(120);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+
+    let inv_size = (pool_size / 50).max(10);
 
     println!("╔══════════════════════════════════════════════╗");
     println!("║     AuthKademlia-RS  Resilience Attacker     ║");
     println!("╚══════════════════════════════════════════════╝");
     println!("  Target      : {target_addr}");
-    println!("  Attacker    : 0.0.0.0:{attacker_port}");
-    println!("  Pool size   : {pool_size} valid + {} invalid (pre-generated)", pool_size / INVALID_RATIO);
-    println!("  Concurrency : {concurrency}  (semaphore — won't overwhelm host CPU)");
-    println!("  Duration    : {duration_secs}s");
+    println!("  Port        : 0.0.0.0:{attacker_port}");
+    println!("  Valid pool  : {pool_size}");
+    println!("  Invalid pool: {inv_size}");
+    println!("  Concurrency : {concurrency}");
     println!();
 
-    // ── Start Node B ──────────────────────────────────────────────────────────
-    let issuer_path = PathBuf::from("issuer.bin");
-    let handler = Arc::new(DIDSignatureVerifierHandler::new(issuer_path));
+    let handler = Arc::new(DIDSignatureVerifierHandler::new(PathBuf::from("issuer.bin")));
     let mut server = Server::new(handler, 20, 3, None, None, true);
-    server
-        .listen(attacker_port, "0.0.0.0")
-        .await
-        .expect("failed to bind UDP socket");
+    server.listen(attacker_port, "0.0.0.0").await.expect("failed to bind UDP socket");
     let server = Arc::new(server);
 
-    // ── Wait for victim ───────────────────────────────────────────────────────
-    println!("[attacker] Waiting 5s for Node A to be ready...");
+    // `depends_on` only guarantees the container started, not that the UDP socket is bound.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // ── Bootstrap with Node A ─────────────────────────────────────────────────
     let parts: Vec<&str> = target_addr.splitn(2, ':').collect();
     let target_ip = parts[0].to_string();
     let target_port: u16 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(5678);
 
     print!("[attacker] Bootstrapping with {target_addr}... ");
-    let discovered = server
-        .bootstrap(vec![(target_ip, target_port)])
-        .await;
+    let victim_addr = (target_ip.clone(), target_port);
+    let discovered = server.bootstrap(vec![(target_ip, target_port)]).await;
     if discovered.is_empty() {
-        println!("WARN: no peers discovered (continuing — victim may still handle RPCs)");
+        println!("WARN: no peers discovered.");
     } else {
-        println!("ok  ({} peer(s))", discovered.len());
+        println!("ok ({} peer(s))", discovered.len());
     }
-
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // ── Pre-generate record pool (blocking, CPU-intensive) ────────────────────
-    let inv_size = pool_size / INVALID_RATIO;
-    println!("[attacker] Pre-generating {pool_size} valid + {inv_size} invalid records...");
-    let t_gen = Instant::now();
+    let proto: Arc<KademliaProtocol> = Arc::clone(
+        server.protocol.as_ref().expect("protocol not initialised"),
+    );
+    let victim: Node = proto.router.read().await
+        .find_neighbors(&proto.source_node, None)
+        .into_iter()
+        .next()
+        .expect("victim not in routing table after bootstrap");
+    println!("[attacker] Victim: {victim}\n");
 
-    let ps = pool_size;
-    let is = inv_size;
+    // Dilithium keypair generation is CPU-intensive; done once before the test phases.
+    print!("[attacker] Generating {pool_size} valid + {inv_size} invalid records... ");
+    let t = Instant::now();
     let (valid_pool, invalid_pool): (Vec<(String, Vec<u8>)>, Vec<(String, Vec<u8>)>) =
         tokio::task::spawn_blocking(move || {
-            let valid: Vec<_> = (0..ps).map(|_| make_record()).collect();
-            let invalid: Vec<_> = (0..is)
-                .map(|_| {
-                    let (key, mut rec) = make_record();
-                    rec[500] ^= 0xFF; // corrupt one byte inside the Dilithium signature
-                    (key, rec)
-                })
-                .collect();
+            let valid: Vec<_> = (0..pool_size).map(|_| make_record()).collect();
+            let invalid: Vec<_> = (0..inv_size).map(|_| {
+                let (key, mut rec) = make_record();
+                rec[500] ^= 0xFF;
+                (key, rec)
+            }).collect();
             (valid, invalid)
         })
         .await
         .unwrap();
+    println!("done ({:.1}s)\n", t.elapsed().as_secs_f64());
 
+    // ── Phase 1: STORE valid records ─────────────────────────────────────────
+    println!("[attacker] Phase 1 — STORE {} valid records  (concurrency={concurrency})",
+             valid_pool.len());
+    let t1 = Instant::now();
+    let (accepted, rejected, store_timeout, stored_keys, mut lat1) =
+        store_phase(Arc::clone(&proto), victim.clone(), valid_pool, concurrency).await;
+    let wall1 = t1.elapsed();
+    print_latency("store-valid", &mut lat1, wall1, accepted, rejected, store_timeout);
+    println!();
+
+    // ── Phase 2: STORE invalid records ───────────────────────────────────────
+    println!("[attacker] Phase 2 — STORE {} invalid records  (concurrency={concurrency})",
+             invalid_pool.len());
+    let t2 = Instant::now();
+    let (inv_accepted, inv_rejected, inv_timeout, _, mut lat2) =
+        store_phase(Arc::clone(&proto), victim.clone(), invalid_pool, concurrency).await;
+    let wall2 = t2.elapsed();
+    print_latency("store-invalid", &mut lat2, wall2, inv_accepted, inv_rejected, inv_timeout);
+    println!();
+
+    // ── Phase 3: GET verify stored keys ──────────────────────────────────────
+    // The victim may have been evicted from the routing table while under load
+    // during Phase 2 (background ping tasks time out → remove from router).
+    // Re-bootstrap to restore the routing table before issuing GET requests.
+    print!("[attacker] Re-bootstrapping before GET phase... ");
+    let rejoined = server.bootstrap(vec![victim_addr]).await;
+    println!("{}", if rejoined.is_empty() { "WARN: no peers" } else { "ok" });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    println!("[attacker] Phase 3 — GET {} stored keys  (concurrency={concurrency})",
+             stored_keys.len());
+    let t3 = Instant::now();
+    let (hits, misses, get_timeout, mut lat3) =
+        get_phase(Arc::clone(&server), stored_keys, concurrency).await;
+    let wall3 = t3.elapsed();
+    let (min3, avg3, p95_3, max3, tps3) = lat3.report(wall3);
     println!(
-        "[attacker] Pool ready in {:.1}s  ({} valid, {} invalid)\n",
-        t_gen.elapsed().as_secs_f64(),
-        valid_pool.len(),
-        invalid_pool.len()
+        "  hit={hits}  miss={misses}  timeout={get_timeout}  \
+         ({:.1}s  {tps3:.1} ops/s)",
+        wall3.as_secs_f64()
     );
-
-    // ── Attack ────────────────────────────────────────────────────────────────
-    println!("[attacker] ━━━ ATTACK START ━━━");
-    println!("[attacker] Flooding Node A for {duration_secs}s with ≤{concurrency} concurrent ops.\n");
-    println!("[attacker] Op mix: 45% valid SET | 25% GET hit | 20% GET miss | 10% invalid SET");
-    println!("[attacker] (After pool exhausted: GET + invalid SET only)\n");
-
-    let stats = Arc::new(Stats::default());
-    let sem = Arc::new(Semaphore::new(concurrency));
-    // Keys we successfully stored — used for GET-hit ops.
-    let stored_keys: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-    let mut jset: JoinSet<()> = JoinSet::new();
-    let deadline = Instant::now() + Duration::from_secs(duration_secs);
-    let attack_start = Instant::now();
-    let mut last_stats = Instant::now();
-    let mut pool_cursor: usize = 0;
-    let mut inv_cursor: usize = 0;
-
-    loop {
-        // ── Print periodic stats ──────────────────────────────────────────────
-        if last_stats.elapsed() >= STATS_INTERVAL {
-            stats.print(attack_start.elapsed().as_secs_f64(), "in progress");
-            last_stats = Instant::now();
-        }
-
-        // ── Drain completed tasks (non-blocking) ──────────────────────────────
-        while jset.try_join_next().is_some() {}
-
-        // ── Check deadline ────────────────────────────────────────────────────
-        if Instant::now() >= deadline {
-            break;
-        }
-
-        // ── Acquire semaphore (blocks when concurrency cap is reached) ─────────
-        // Use a short timeout so the loop can re-check the deadline even when
-        // all slots are busy, preventing overshoot of DURATION_SECS.
-        let permit = match tokio::time::timeout(
-            Duration::from_millis(500),
-            Arc::clone(&sem).acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(p)) => p,
-            _ => continue,
-        };
-
-        // ── Select op ─────────────────────────────────────────────────────────
-        let r: f64 = rand::random();
-        let pool_remaining = pool_size.saturating_sub(pool_cursor);
-        let stored_count = stored_keys.lock().await.len();
-
-        let op: Op = if pool_remaining > 0 && r < 0.45 {
-            // Valid SET from pre-generated pool
-            let (key, record) = valid_pool[pool_cursor].clone();
-            pool_cursor += 1;
-            Op::SetValid { key, record }
-        } else if stored_count > 0 && r < 0.70 {
-            // GET for a key the attacker already stored (cache-hit / storage-hit path)
-            let keys = stored_keys.lock().await;
-            let idx = rand::random::<usize>() % keys.len();
-            let key = keys[idx].clone();
-            drop(keys);
-            Op::GetKnown { key }
-        } else if r < 0.90 {
-            // GET for a random UUID — guaranteed miss, exercises DHT routing
-            Op::GetMiss {
-                key: Uuid::new_v4().to_string(),
-            }
-        } else {
-            // Invalid SET: record with tampered Dilithium signature.
-            // Node A MUST reject it. The same key is cycled (modulo) so the same
-            // rejection path is exercised repeatedly without expanding state.
-            let (key, record) = invalid_pool[inv_cursor % invalid_pool.len()].clone();
-            inv_cursor += 1;
-            Op::SetInvalid { key, record }
-        };
-
-        // ── Spawn op task ──────────────────────────────────────────────────────
-        let node = Arc::clone(&server);
-        let st = Arc::clone(&stats);
-        let sk = Arc::clone(&stored_keys);
-
-        match op {
-            Op::SetValid { key, record } => {
-                jset.spawn(async move {
-                    let _permit = permit;
-                    match timeout(OP_TIMEOUT, node.set(&key, record)).await {
-                        Ok(Some(true)) => {
-                            st.set_ok.fetch_add(1, Ordering::Relaxed);
-                            sk.lock().await.push(key);
-                        }
-                        Ok(_) => {
-                            st.set_rejected.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(_) => {
-                            st.set_timeout.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                });
-            }
-
-            Op::GetKnown { key } => {
-                jset.spawn(async move {
-                    let _permit = permit;
-                    match timeout(OP_TIMEOUT, node.get(&key)).await {
-                        Ok(Some(_)) => {
-                            st.get_hit.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Ok(None) => {
-                            // Record not found — possible if DHT hasn't propagated yet.
-                            st.get_miss.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(_) => {
-                            st.get_timeout.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                });
-            }
-
-            Op::GetMiss { key } => {
-                jset.spawn(async move {
-                    let _permit = permit;
-                    match timeout(OP_TIMEOUT, node.get(&key)).await {
-                        Ok(Some(_)) => {
-                            // Unexpected hit for a random UUID — not a security issue,
-                            // just an extremely unlikely UUID collision.
-                            st.get_hit.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Ok(None) => {
-                            st.get_miss.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(_) => {
-                            st.get_timeout.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                });
-            }
-
-            Op::SetInvalid { key, record } => {
-                jset.spawn(async move {
-                    let _permit = permit;
-                    match timeout(OP_TIMEOUT, node.set(&key, record)).await {
-                        // set() returns None when signature verification fails —
-                        // this is the expected outcome for a tampered record.
-                        Ok(None) => {
-                            st.invalid_rejected.fetch_add(1, Ordering::Relaxed);
-                        }
-                        // Some(_) means the record was accepted — security failure.
-                        Ok(Some(_)) => {
-                            st.invalid_accepted.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(_) => {
-                            st.get_timeout.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                });
-            }
-        }
+    if !lat3.samples.is_empty() {
+        println!(
+            "  latency [get]  min={min3:.1}ms  avg={avg3:.1}ms  \
+             p95={p95_3:.1}ms  max={max3:.1}ms"
+        );
     }
+    println!();
 
-    // ── Drain remaining in-flight tasks ───────────────────────────────────────
-    while jset.join_next().await.is_some() {}
-
-    // ── Final report ──────────────────────────────────────────────────────────
-    println!("\n[attacker] ━━━ ATTACK COMPLETE ━━━\n");
-    stats.print(attack_start.elapsed().as_secs_f64(), "FINAL");
-
-    let snap = stats.snapshot();
-    let total = snap.set_ok
-        + snap.set_rej
-        + snap.set_to
-        + snap.get_hit
-        + snap.get_miss
-        + snap.get_to
-        + snap.inv_rej
-        + snap.inv_acc;
-
+    // ── Verdict ───────────────────────────────────────────────────────────────
     println!("━━━ Resilience verdict ━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-    // Node A liveness: low timeout rate means A kept responding.
-    let timeouts = snap.set_to + snap.get_to;
-    let timeout_rate = if total > 0 {
-        timeouts as f64 / total as f64
+    if inv_accepted == 0 {
+        println!("  [✓] Security intact     all {inv_rejected} tampered records rejected");
+    } else {
+        eprintln!("  [✗] SECURITY FAILURE    {inv_accepted} tampered records accepted by Node A!");
+    }
+
+    if accepted > 0 {
+        println!("  [✓] Store functional    {accepted}/{} valid records accepted",
+                 accepted + rejected + store_timeout);
+    } else {
+        println!("  [!] No valid records stored (connectivity issue?)");
+    }
+
+    let miss_rate = if hits + misses > 0 {
+        misses as f64 / (hits + misses) as f64
     } else {
         0.0
     };
-    if timeout_rate < 0.10 {
-        println!("  [✓] Node A responsive   timeout rate {:.1}% < 10%", timeout_rate * 100.0);
+    if miss_rate < 0.05 {
+        println!("  [✓] Retrieval reliable  miss rate {:.1}%", miss_rate * 100.0);
     } else {
-        println!("  [!] Node A degraded      timeout rate {:.1}% ≥ 10%  (overloaded)", timeout_rate * 100.0);
+        println!("  [!] Retrieval degraded  miss rate {:.1}%", miss_rate * 100.0);
     }
 
-    // Security: all invalid records must be rejected.
-    if snap.inv_acc == 0 {
-        println!("  [✓] Security intact      all {} invalid records rejected", snap.inv_rej);
-    } else {
-        eprintln!(
-            "  [✗] SECURITY FAILURE     {} invalid records accepted by Node A!",
-            snap.inv_acc
-        );
-    }
-
-    // Immutability: no duplicate accepted.
-    // (set_rejected includes both dup-key and sig-failure; invalid_accepted above covers sig bypass)
-    println!("  [✓] Valid SETs stored    {}", snap.set_ok);
-    println!("  [✓] Rejected SETs        {} (dup/invalid)", snap.set_rej);
+    let (_, avg1, p95_1, max1, tps1) = lat1.report(wall1);
+    println!("\n  Throughput summary:");
+    println!("    store-valid   {tps1:>6.1} ops/s  avg={avg1:.1}ms  p95={p95_1:.1}ms  max={max1:.1}ms");
+    let (_, avg2, p95_2, max2, tps2) = lat2.report(wall2);
+    println!("    store-invalid {tps2:>6.1} ops/s  avg={avg2:.1}ms  p95={p95_2:.1}ms  max={max2:.1}ms");
+    println!("    get           {tps3:>6.1} ops/s  avg={avg3:.1}ms  p95={p95_3:.1}ms  max={max3:.1}ms");
 
     println!();
-    if snap.inv_acc == 0 {
-        println!("  RESULT: Node A survived the attack without security violations.");
-        if timeout_rate >= 0.10 {
-            println!("  NOTE:   High timeout rate indicates Node A was CPU-saturated but did NOT crash.");
-            println!("          This is expected behaviour under resource-limited conditions.");
-        }
+    if inv_accepted == 0 {
+        println!("  RESULT: Node A survived — no security violations.");
     } else {
-        eprintln!("  RESULT: SECURITY FAILURE — Node A accepted invalid records.");
+        eprintln!("  RESULT: SECURITY FAILURE — Node A accepted tampered records.");
         std::process::exit(1);
     }
+
+    // Machine-readable summary — parsed by resilience/run_stats.py
+    let total_valid   = accepted + rejected + store_timeout;
+    let total_invalid = inv_accepted + inv_rejected + inv_timeout;
+    println!(
+        "METRICS_JSON {}",
+        serde_json::to_string(&serde_json::json!({
+            "pool_size":          total_valid,
+            "inv_size":           total_invalid,
+            "concurrency":        concurrency,
+            "p1_accepted":        accepted,
+            "p1_rejected":        rejected,
+            "p1_timeout":         store_timeout,
+            "p1_avg_ms":          avg1,
+            "p1_p95_ms":          p95_1,
+            "p1_max_ms":          max1,
+            "p1_tps":             tps1,
+            "p2_accepted":        inv_accepted,
+            "p2_rejected":        inv_rejected,
+            "p2_timeout":         inv_timeout,
+            "p2_avg_ms":          avg2,
+            "p2_p95_ms":          p95_2,
+            "p2_tps":             tps2,
+            "p3_hits":            hits,
+            "p3_misses":          misses,
+            "p3_timeout":         get_timeout,
+            "p3_avg_ms":          avg3,
+            "p3_p95_ms":          p95_3,
+            "p3_max_ms":          max3,
+            "p3_tps":             tps3,
+        }))
+        .unwrap()
+    );
 }
