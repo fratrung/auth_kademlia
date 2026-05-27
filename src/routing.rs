@@ -118,9 +118,9 @@ impl KBucket {
         }
         let first = &self.nodes[0].id;
         let mut prefix_len = 0;
-        'outer: for byte_idx in 0..first.len() {
+        'outer: for (byte_idx, &byte) in first.iter().enumerate() {
             for shift in (0..8).rev() {
-                let bit = (first[byte_idx] >> shift) & 1;
+                let bit = (byte >> shift) & 1;
                 for node in self.nodes.iter().skip(1) {
                     if ((node.id[byte_idx] >> shift) & 1) != bit {
                         break 'outer;

@@ -8,6 +8,7 @@
 /// Responses are correlated by `msg_id` via a `PendingMap`.
 ///
 use std::collections::HashMap;
+use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -133,6 +134,8 @@ struct Frame {
 
 type PendingMap = Arc<Mutex<HashMap<u32, oneshot::Sender<RpcMessage>>>>;
 
+const INVALID_SIG_BAN_THRESHOLD: u32 = 3;
+
 pub struct KademliaProtocol {
     pub router: Arc<RwLock<RoutingTable>>,
     pub storage: Arc<ForgetfulStorage>,
@@ -142,6 +145,9 @@ pub struct KademliaProtocol {
     /// Shared with `Server` so a verification result cached in one layer is
     /// immediately reused by the other. `None` when the cache is disabled.
     sig_cache: Option<Arc<SignatureCache>>,
+    /// Counts invalid-signature Store attempts per sender. A peer is removed
+    /// from the routing table once it reaches INVALID_SIG_BAN_THRESHOLD.
+    invalid_sig_strikes: DashMap<[u8; ID_LEN], u32>,
     pending: PendingMap,
     next_msg_id: AtomicU32,
     next_frag_id: AtomicU32,
@@ -165,6 +171,7 @@ impl KademliaProtocol {
             socket,
             signature_handler,
             sig_cache,
+            invalid_sig_strikes: DashMap::new(),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_msg_id: AtomicU32::new(0),
             next_frag_id: AtomicU32::new(0),
@@ -462,10 +469,36 @@ impl KademliaProtocol {
         key: [u8; ID_LEN],
         value: Vec<u8>,
     ) -> bool {
+        
+        // Peer Ban Mechanism
         if !self.verify_for_key(&key, &value).await {
-            log::error!("rpc_store: invalid signature for {}", hex::encode(key));
+            let strikes = {
+                let mut n = self.invalid_sig_strikes.entry(sender_id).or_insert(0);
+                *n += 1;
+                *n
+            };
+            let source = Node::new(sender_id, Some(sender_addr.0.clone()), Some(sender_addr.1));
+            if strikes >= INVALID_SIG_BAN_THRESHOLD {
+                log::warn!(
+                    "rpc_store: {} invalid-sig strikes from {} — removing from routing table",
+                    strikes,
+                    sender_addr.0
+                );
+                self.router.write().await.remove_contact(&source);
+            } else {
+                log::warn!(
+                    "rpc_store: invalid signature for {} from {} (strike {}/{})",
+                    hex::encode(key),
+                    sender_addr.0,
+                    strikes,
+                    INVALID_SIG_BAN_THRESHOLD
+                );
+                let p = Arc::clone(self);
+                tokio::spawn(async move { p.welcome_if_new(source).await });
+            }
             return false;
         }
+
         // Atomic insert: rejects duplicate keys without a TOCTOU race window.
         if !self.storage.insert_if_absent(key.to_vec(), value) {
             log::error!("rpc_store: record {} already exists", hex::encode(key));

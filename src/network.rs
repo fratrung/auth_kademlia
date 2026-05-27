@@ -37,8 +37,7 @@ impl Server {
     /// - `alpha`             — lookup concurrency factor.
     /// - `node_id`           — fixed node ID; `None` picks one at random.
     /// - `storage`           — custom storage; `None` uses the default TTL store.
-    /// - `use_cache`         — enable the Dilithium verification cache. Set to
-    ///                         `false` only for benchmarking or security audits.
+    /// - `use_cache`         — enable the Dilithium verification cache
     pub fn new(
         signature_handler: Arc<dyn SignatureVerifierHandler>,
         ksize: usize,

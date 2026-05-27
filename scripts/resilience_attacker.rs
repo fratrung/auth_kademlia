@@ -3,7 +3,7 @@
 /// Runs three sequential phases against Node A:
 ///   1. STORE valid    — sends `POOL_SIZE` valid DID records; reports latency distribution.
 ///   2. STORE invalid  — sends `POOL_SIZE/3` tampered records (one sig byte flipped);
-///                       every acceptance is a security failure.
+///      every acceptance is a security failure.
 ///   3. GET verify     — retrieves every key accepted in phase 1; reports latency distribution.
 ///
 /// Each record is sent exactly once. Concurrency is bounded by `CONCURRENCY`.
