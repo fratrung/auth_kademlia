@@ -39,6 +39,9 @@ maturin develop --features python
   `generate_keypair`) return `PyBytes` / `(PyBytes, PyBytes)` — Python callers
   receive native `bytes` objects directly, no implicit list conversion.
 - `Server.get()` returns `bytes | None` (not `list | None`).
+- `Server(sig_cache=True/False)` controls the Dilithium signature cache (default
+  `False`). Pass `sig_cache=True` to enable it in production for repeated-record
+  workloads.
 
 ## Tokio runtime — caller responsibility
 

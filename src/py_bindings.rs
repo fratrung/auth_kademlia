@@ -80,12 +80,13 @@ impl PyServer {
     ///     node_id (bytes):    Fixed 20-byte node ID.  Pass ``None`` for a
     ///                         random ID (recommended for most deployments).
     #[new]
-    #[pyo3(signature = (ksize=20, alpha=3, issuer_path=None, node_id=None))]
+    #[pyo3(signature = (ksize=20, alpha=3, issuer_path=None, node_id=None, sig_cache=false))]
     fn new(
         ksize: usize,
         alpha: usize,
         issuer_path: Option<String>,
         node_id: Option<Vec<u8>>,
+        sig_cache: bool,
     ) -> PyResult<Self> {
         // When issuer_path is None we pass an empty PathBuf.  The DID handler
         // lazy-loads the key only for status-list verification; all other
@@ -112,7 +113,7 @@ impl PyServer {
             None => None,
         };
 
-        let server = Server::new(handler, ksize, alpha, fixed_id, None, true);
+        let server = Server::new(handler, ksize, alpha, fixed_id, None, sig_cache);
         Ok(Self {
             inner: Arc::new(RwLock::new(server)),
         })
@@ -548,7 +549,7 @@ impl PyEd25519KeyManager {
 fn init_runtime() {
     let parallelism = std::thread::available_parallelism()
         .map(|p| p.get())
-        .unwrap_or(4);
+        .unwrap_or(2);
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.max_blocking_threads(parallelism).enable_all();
