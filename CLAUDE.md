@@ -18,7 +18,7 @@ Application-layer logic (provisioning, REST APIs, orchestration) remains in Pyth
 ```
 cargo build                          # library + dht_node binary
 cargo build --bin dht_node           # only the Docker entry point
-cargo test                           # all 131 tests
+cargo test                           # all 146 tests
 cargo test <name>                    # single test, e.g. test_delete_did_record
 RUST_LOG=debug cargo test -- --nocapture   # verbose output
 ```
@@ -73,7 +73,7 @@ default cap of 512 blocking threads, which thrashes the CPU on low-core SoCs.
 | `src/protocol.rs` | UDP transport, fragmentation, RPC dispatch (`rpc_store`, `rpc_update`, `rpc_delete`, `rpc_find_node`, `rpc_find_value`) |
 | `src/network.rs` | Public `Server` API: `set/get/update/delete`, bootstrap, refresh loop |
 | `src/crawling.rs` | Iterative lookup — `NodeSpiderCrawl` (find nodes) + `ValueSpiderCrawl` (find value) |
-| `src/routing.rs` | Kademlia routing table + k-buckets (XOR distance, bucket splits) |
+| `src/routing.rs` | Kademlia routing table + k-buckets (XOR distance, bucket splits); `KBucket` holds a primary LRU list + `replacement_nodes` overflow (§4.1); `TableTraverser` visits buckets in XOR-proximity order (mirrors Python AuthKademlia exactly); `touch_last_updated()` is called **only** by `TableTraverser` — bucket staleness reflects lookup activity, not node additions |
 | `src/storage.rs` | `ForgetfulStorage` — sharded concurrent TTL KV store (`DashMap`); lazy expiry on read |
 | `src/signature_cache.rs` | `SignatureCache` — moka bounded cache (SHA-256 key, TTL 1 h, 4096 entries) for Dilithium verification results |
 | `src/fragmentation.rs` | KADF fragmentation + reassembly (`encode_fragments`, `parse_fragment`, `ReassemblyMap`) |
@@ -136,6 +136,7 @@ All RPCs are serialised with `bincode` and framed with a `(msg_id: u32, is_reque
 - `SignatureCache` is keyed on `SHA-256(record_bytes)`. TTL 1 h, capacity 4096 (moka TinyLFU). Eviction = cache miss = full re-verification (never a security bypass). On a cache miss the SHA-256 key is computed once via `compute_key()` and reused for both `get_by_key` and `insert_by_key` — never twice.
 - `welcome_if_new` replication uses two conditions (Kademlia §2.5, matches Python AuthKademlia): `new_node_close` (new node is XOR-closer than the farthest k-neighbor) AND `this_closest` (this node is closer than the nearest k-neighbor). Both must be true to replicate. Neighbors are computed before `add_contact` so the new node is excluded from comparisons.
 - `schedule_stats_log()` emits a `[stats]` log line every 60 s: routing table size, storage record count, and (when the cache is enabled) signature cache entry count. Detects silent failures — routing table collapse, cache regression — on embedded nodes without direct access.
+- **Routing table internals** (`src/routing.rs`): `KBucket.add_node()` does **not** update `last_updated` — matches Python AuthKademlia behaviour where only lookups reset the timer. `touch_last_updated()` (called by `TableTraverser` on the central bucket during every `find_neighbors`) is the sole update point. `find_neighbors` uses `TableTraverser` with early-stop at k and excludes `target.id` — identical logic to Python's `find_neighbors + heapq.nsmallest`. Split condition §4.2: `covers(local_node) OR depth % 5 != 0`.
 
 ## Key invariants
 - Records are **immutable after creation**: `rpc_store` rejects duplicate keys.
@@ -154,7 +155,7 @@ All RPCs are serialised with `bincode` and framed with a `(msg_id: u32, is_reque
 ## Test suite structure
 | File | Count | Notes |
 |---|---|---|
-| `tests/network_tests.rs` | 8 | Full multi-node integration tests (real UDP) |
+| `tests/network_tests.rs` | 10 | Full multi-node integration tests (real UDP) |
 | `tests/crypto_tests.rs` | 27 | Crypto layer unit + DID handler unit tests |
 | `tests/routing_tests.rs` | 20 | Routing table unit tests |
 | `tests/storage_tests.rs` | 17 | `ForgetfulStorage` unit tests (includes `insert_if_absent` cases) |
@@ -164,7 +165,7 @@ All RPCs are serialised with `bincode` and framed with a `(msg_id: u32, is_reque
 | `tests/scenarios/churn.rs` | 1 | Publisher leaves, record survives for new joiner |
 | `tests/scenarios/worker_pool.rs` | 1 | 40-client burst, all responses delivered |
 | `tests/scenarios/crypto.rs` | 4 | End-to-end crypto invariants (tamper, injection, downgrade, revocation) |
-| `src/**` (inline) | 56 | Module-level `#[test]` blocks |
+| `src/**` (inline) | 62 | Module-level `#[test]` blocks (routing.rs adds 5 new tests for TableTraverser / touch_last_updated semantics) |
 
 All tests are network-clean (loopback only) and run in parallel without interference when port ranges are respected.
 
@@ -186,6 +187,7 @@ All tests are network-clean (loopback only) and run in parallel without interfer
 | 15792–15795 | scenario: churn survivability (A seed, B publisher, C stays, D new joiner) |
 | 15800–15840 | scenario: worker pool burst (target + 40 clients) |
 | 15810–15817 | cache_bench example (Phase 1 + Phase 2 clusters) |
+| 15810–15839 | topology_analysis example (30-node cluster) — **do not run simultaneously with cache_bench** |
 | 15860–15861 | scenario: tampered payload / algorithm injection rejected |
 | 15862–15863 | scenario: downgrade attack after rotation rejected |
 | 15864–15865 | scenario: revoked key cannot authorise further rotation |
@@ -193,6 +195,45 @@ All tests are network-clean (loopback only) and run in parallel without interfer
 When adding a new integration test use ports **15866+** and document them here.
 
 | 15900 | resilience test: Node A victim (host-exposed UDP, Docker only) |
+
+## Examples
+
+### `examples/cache_bench.rs`
+Signature-cache benchmark in two isolated phases:
+- **Phase 1** — DHT SET throughput (cached vs uncached clusters, no CPU contention).
+- **Phase 2** — Dilithium-2 verification micro-benchmark (records injected directly into local storage, sequential `get()` calls, zero network variance).
+
+```bash
+cargo run --release --example cache_bench
+```
+
+### `examples/topology_analysis.rs`
+30-node DHT topology analyser. Publishes 100 authenticated DID records from rotating writers, retrieves each from a node offset by half the cluster size (forcing real multi-hop lookups), then prints:
+
+1. **Latency table** — SET/GET avg, p50, p95, max.
+2. **Sample DID Documents** — full JSON of 3 published records.
+3. **Storage tables** — which DHT keys live on which node (with DID URI cross-reference).
+4. **Replication summary** — copy-count distribution per key.
+5. **XOR-distance correctness** — for each sampled record, identifies the k globally-closest nodes (XOR metric) and verifies they actually hold the record (Kademlia §2.3).
+6. **Bucket structure** — per-node k-bucket tree: bucket index, range boundaries, node count, depth, fresh/lonely status, and the nodes inside each bucket. Verifies correct binary splitting (§4.2).
+7. **Routing convergence** — avg buckets per node vs expected log₂(N); avg peers per node.
+8. **Flat routing tables** — full peer list per node for reference.
+
+```bash
+# default k=20 alpha=3
+cargo run --release --example topology_analysis
+
+# k=3: records replicated only on 3 closest nodes — best for observing XOR correctness
+cargo run --release --example topology_analysis -- 3 3
+
+# k=5 with DHT logs
+RUST_LOG=info cargo run --release --example topology_analysis -- 5 2
+```
+
+Use this example to verify:
+- **Routing**: bucket splits occur at the right depth (§4.2), avg buckets ≈ log₂(N).
+- **Replication**: records land on the k globally-closest nodes, not arbitrary ones.
+- **Convergence**: after 2 bootstrap passes, every node knows ≈ k × log₂(N) peers.
 
 ## Docker
 

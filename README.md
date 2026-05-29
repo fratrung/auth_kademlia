@@ -262,6 +262,33 @@ own hardware (fixed at 10 000 ops, c=30 for DHT SET; 500 ops sequential for the
 micro-benchmark). The cache can be disabled per-node by passing `use_cache: false`
 to `Server::new` for benchmarking or security auditing.
 
+### Routing topology diagnostic
+
+`examples/topology_analysis.rs` builds an in-process cluster of N nodes, stores M records, then emits eight diagnostic sections that verify Kademlia routing correctness without any mocks:
+
+| Section | What it checks |
+|---|---|
+| **Node discovery** | Each node lists the peers it found after bootstrapping |
+| **Routing table size** | Peer count per node — confirms convergence |
+| **Sample DID Documents** | 3 raw records stored in the DHT |
+| **Storage per node** | Which keys each node holds |
+| **Replication summary** | Copy-count distribution across the cluster |
+| **XOR correctness** | For each sampled record: are the k XOR-closest nodes the ones actually storing it? |
+| **Bucket structure** | Per-node bucket tree — index, node count, depth, fresh/lonely, range start |
+| **Flat routing tables** | Full peer list per node with IP:port |
+
+The XOR-correctness check is the key invariant: it sorts all nodes by XOR distance to each record's key and verifies that the k-closest nodes are the holders. Each record is labelled `[✓]` (all k-closest hold it), `[~]` (partial), or `[✗]` (none of the k-closest hold it).
+
+```bash
+# k=3 replication factor, 30 nodes, 100 records (default)
+cargo run --release --example topology_analysis -- 3 30
+
+# smaller cluster for quick inspection
+cargo run --release --example topology_analysis -- 3 10
+```
+
+The bucket-structure section also reports convergence quality: average buckets per node should approach log₂(N) for a well-converged cluster.
+
 ### Resilience &amp; robustness tests (Docker)
 
 `resilience/` contains three Docker-based scenarios that measure crash resistance,

@@ -37,7 +37,9 @@ fn test_add_single_peer_and_find() {
     let peer = make_node("peer_a");
     rt.add_contact(peer.clone());
 
-    let found = rt.find_neighbors(&peer, None);
+    // Search for a different target: find_neighbors excludes the target itself
+    // (matches Python's `neighbor.id != node.id` check).
+    let found = rt.find_neighbors(&make_node("target"), None);
     assert!(!found.is_empty(), "peer should be in the routing table");
     assert!(found.iter().any(|n| n.id == peer.id));
 }
